@@ -1,0 +1,509 @@
+#!/bin/bash
+# claude-code-tab-notify
+# Claude Code notifications that take you to the right terminal tab.
+#
+# Subcommands:
+#   notify    post a notification for this session   (Stop, Notification hooks)
+#   clear     drop this session's notification       (UserPromptSubmit hook)
+#   focus H   select the tab for handle H            (run by a notification click)
+#   resolve   print this session's handle, then its tab name
+#   doctor    check the pieces this depends on
+
+set -uo pipefail
+
+# The click callback is stored inside every delivered notification, so this path
+# must be the real one on disk. A symlinked or relative invocation would bake in
+# a path that stops resolving the moment the caller's directory changes.
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# Overridable so the test suite can post without touching real notifications.
+GROUP_PREFIX="${CCTN_GROUP_PREFIX:-claude-code-tab-notify}"
+
+TERMINAL_NOTIFIER_BUNDLE_ID="fr.julienxx.oss.terminal-notifier"
+
+# A handle is "<terminal>:<identifier>". Each terminal offers a different
+# identifier, so the kind travels with it rather than being guessed on the way back.
+#   iterm:<session uuid>     stable per session
+#   terminal:<tty>           Terminal.app exposes tty per tab
+#   ghostty:<tab id>         matched by working directory, only when unambiguous
+
+# ---------------------------------------------------------------- helpers ---
+
+INPUT=""
+
+read_stdin() {
+    # Hooks pipe JSON in. A tty means a human ran this by hand, and reading
+    # would hang waiting for input that is never coming.
+    if [ -t 0 ]; then INPUT=""; else INPUT=$(cat); fi
+}
+
+json_get() {
+    [ -n "$INPUT" ] || return 0
+    if command -v jq >/dev/null 2>&1; then
+        echo "$INPUT" | jq -r "$1 // empty" 2>/dev/null
+    else
+        echo "$INPUT" | /usr/bin/python3 -c '
+import json, sys
+key = sys.argv[1].lstrip(".")
+try:
+    value = json.load(sys.stdin).get(key, "")
+except Exception:
+    value = ""
+print("" if value is None else value if isinstance(value, str) else str(value).lower())
+' "$1" 2>/dev/null
+    fi
+}
+
+# GNU timeout is not on a stock macOS, and a missing one fails open: the command
+# never runs and nothing reports why. perl ships with the system.
+bounded() { perl -e 'alarm shift; exec @ARGV' "$@" 2>/dev/null; }
+
+is_macos() { [ "$(uname -s)" = "Darwin" ]; }
+
+have_notifier() { command -v terminal-notifier >/dev/null 2>&1; }
+
+# Asking an app a question through a `tell` launches it. This test does not,
+# which keeps a session under one terminal from starting three others.
+app_running() {
+    [ "$(osascript -e "application \"$1\" is running" 2>/dev/null)" = "true" ]
+}
+
+# Under tmux the ancestor tty is the pane's pty, owned by the tmux server rather
+# than by any terminal. The attached client's tty is the real one.
+find_tmux_client_tty() {
+    [ -n "${TMUX:-}" ] || return 0
+    command -v tmux >/dev/null 2>&1 || return 0
+    local pane_session
+    pane_session=$(tmux display-message -p -t "${TMUX_PANE:-}" '#{session_id}' 2>/dev/null)
+    [ -n "$pane_session" ] || return 0
+    tmux list-clients -t "$pane_session" -F '#{client_tty}' 2>/dev/null | head -1
+}
+
+# Hooks run without a controlling terminal; the claude process above them has one.
+find_ancestor_tty() {
+    local pid=$PPID hops=0 ppid tt
+    while [ "$hops" -lt 12 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+        read -r ppid tt <<<"$(ps -o ppid=,tty= -p "$pid" 2>/dev/null)"
+        [ -n "$ppid" ] || return 0
+        if [ -n "$tt" ] && [ "$tt" != "??" ]; then
+            echo "/dev/$tt"
+            return 0
+        fi
+        pid=$ppid
+        hops=$((hops + 1))
+    done
+}
+
+session_tty() {
+    local tty
+    tty=$(find_tmux_client_tty)
+    [ -n "$tty" ] || tty=$(find_ancestor_tty)
+    echo "$tty"
+}
+
+# ------------------------------------------------------- resolve per app ----
+
+# $ITERM_SESSION_ID is preferred but never trusted: it is absent in some
+# sessions, and iTerm assigns a new id when it restores a tab, so a stale value
+# would point at a tab that no longer exists.
+resolve_iterm() {
+    app_running "iTerm2" || return 0
+    # Unset in some sessions, which is the case this whole fallback exists for.
+    local want_id="${ITERM_SESSION_ID:-}"
+    osascript - "${want_id##*:}" "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set wantID to item 1 of argv
+  set wantTTY to item 2 of argv
+  set ttyMatch to ""
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if wantID is not "" and (id of s) is wantID then ¬
+            return "iterm:" & (id of s) & linefeed & (name of s)
+          if wantTTY is not "" and (tty of s) is wantTTY then ¬
+            set ttyMatch to "iterm:" & (id of s) & linefeed & (name of s)
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return ttyMatch
+end run
+APPLESCRIPT
+}
+
+resolve_terminal_app() {
+    [ -n "$1" ] || return 0
+    app_running "Terminal" || return 0
+    osascript - "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set wantTTY to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t) is wantTTY then
+          -- Terminal tabs have no `name`; asking for one fails with -1700.
+          set tabName to ""
+          try
+            set tabName to custom title of t
+          end try
+          if tabName is "" then set tabName to (processes of t) as text
+          return "terminal:" & wantTTY & linefeed & tabName
+        end if
+      end repeat
+    end repeat
+  end tell
+  return ""
+end run
+APPLESCRIPT
+}
+
+# Ghostty exposes no tty and no pid, so the working directory is the only handle
+# available. Two tabs in one project share it, and sending you to the wrong tab
+# is worse than sending you nowhere, so a match counts only when it is unique.
+resolve_ghostty() {
+    [ -n "$1" ] || return 0
+    app_running "Ghostty" || return 0
+    osascript - "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set wantDir to item 1 of argv
+  set matchIDs to {}
+  set matchNames to {}
+  tell application "Ghostty"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with trm in terminals of t
+          if (working directory of trm) is wantDir then
+            set end of matchIDs to (id of t)
+            set end of matchNames to (name of t)
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  if (count of matchIDs) is 1 then ¬
+    return "ghostty:" & (item 1 of matchIDs) & linefeed & (item 1 of matchNames)
+  return ""
+end run
+APPLESCRIPT
+}
+
+# Tries each running terminal rather than trusting $TERM_PROGRAM, which is absent
+# from some hook environments for the same reason $ITERM_SESSION_ID is.
+resolve_handle() {
+    is_macos || return 0
+    local want_tty result
+    want_tty=$(session_tty)
+
+    result=$(resolve_iterm "$want_tty")
+    [ -n "$result" ] && { echo "$result"; return 0; }
+
+    result=$(resolve_terminal_app "$want_tty")
+    [ -n "$result" ] && { echo "$result"; return 0; }
+
+    result=$(resolve_ghostty "${1:-}")
+    [ -n "$result" ] && { echo "$result"; return 0; }
+}
+
+# --------------------------------------------------------- focus per app ----
+
+focus_iterm() {
+    osascript - "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set targetID to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (id of s) is targetID then
+            select w
+            select t
+            select s
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+APPLESCRIPT
+}
+
+focus_terminal_app() {
+    osascript - "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set wantTTY to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t) is wantTTY then
+          set selected of t to true
+          set index of w to 1
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+APPLESCRIPT
+}
+
+focus_ghostty() {
+    osascript - "$1" <<'APPLESCRIPT' 2>/dev/null
+on run argv
+  set targetID to item 1 of argv
+  tell application "Ghostty"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (id of t) is targetID then
+          select tab t
+          activate
+          return "ok"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+APPLESCRIPT
+}
+
+# ---------------------------------------------------------------- notify ----
+
+cmd_notify() {
+    read_stdin
+    have_notifier || exit 0
+
+    local hook_event transcript_path notification_msg payload_cwd session_dir
+    hook_event=$(json_get '.hook_event_name')
+    hook_event=${hook_event:-Unknown}
+
+    # Claude re-runs the Stop hook when it continues from its own stop. Nothing
+    # is waiting on you at that point.
+    if [ "$hook_event" = "Stop" ] && [ "$(json_get '.stop_hook_active')" = "true" ]; then
+        exit 0
+    fi
+
+    transcript_path=$(json_get '.transcript_path')
+    notification_msg=$(json_get '.message')
+    payload_cwd=$(json_get '.cwd')
+    [ -n "$payload_cwd" ] || payload_cwd=$(pwd)
+    session_dir=$(basename "$payload_cwd")
+
+    # Tool calls and thinking blocks also live in content[], so select on type
+    # rather than trusting the first element.
+    local last_assistant_msg=""
+    if [ -f "$transcript_path" ] && [ "$hook_event" = "Stop" ] && command -v jq >/dev/null 2>&1; then
+        last_assistant_msg=$(tail -40 "$transcript_path" 2>/dev/null | \
+            jq -r 'select(.message.role == "assistant")
+                   | [.message.content[]? | select(.type == "text") | .text]
+                   | join(" ")' 2>/dev/null | \
+            grep -v '^$' | tail -1 | tr '\n' ' ' | cut -c1-100)
+    fi
+
+    local title msg sound
+    case "$hook_event" in
+        Notification)
+            title="Input Required"
+            msg=${notification_msg:-"Claude needs your input"}
+            sound="Glass"
+            ;;
+        Stop)
+            title="Task Complete"
+            msg=${last_assistant_msg:-"Task completed"}
+            sound="Blow"
+            ;;
+        *)
+            title="Claude Code"
+            msg=${notification_msg:-"Claude has an update"}
+            sound="default"
+            ;;
+    esac
+
+    local info handle tab_title claude_session_id
+    info=$(bounded 8 bash "$SELF" resolve "$payload_cwd")
+    handle=$(echo "$info" | head -1)
+    tab_title=$(echo "$info" | sed -n 2p)
+    claude_session_id=$(json_get '.session_id')
+
+    # Claude's own session id keeps sibling tabs in one project distinct when no
+    # tab resolves. Falling back to the directory collapses them.
+    local group_id="${handle#*:}"
+    local group_key="$GROUP_PREFIX:${group_id:-${claude_session_id:-$session_dir}}"
+
+    # Raising the wrong terminal would be worse than doing nothing, so an
+    # unrecognized one gets no click action at all.
+    local fallback_app=""
+    case "${TERM_PROGRAM:-}" in
+        iTerm.app)      fallback_app="com.googlecode.iterm2" ;;
+        Apple_Terminal) fallback_app="com.apple.Terminal" ;;
+        vscode)         fallback_app="com.microsoft.VSCode" ;;
+        WarpTerminal)   fallback_app="dev.warp.Warp" ;;
+        ghostty)        fallback_app="com.mitchellh.ghostty" ;;
+    esac
+
+    local args
+    args=(
+        -title "Claude Code ($session_dir)"
+        -subtitle "${tab_title:-$title}"
+        -message "$msg"
+        -sound "$sound"
+        -group "$group_key"
+    )
+
+    if [ -n "$handle" ]; then
+        args+=(-execute "'$SELF' focus '$handle'")
+    elif [ -n "$fallback_app" ]; then
+        args+=(-activate "$fallback_app")
+    fi
+
+    terminal-notifier "${args[@]}" >/dev/null 2>&1
+}
+
+# ----------------------------------------------------------------- clear ----
+
+cmd_clear() {
+    have_notifier || exit 0
+
+    local keys=()
+    if [ -n "${1:-}" ]; then
+        keys+=("$GROUP_PREFIX:${1#*:}")
+    else
+        read_stdin
+        local claude_session_id payload_cwd handle
+        claude_session_id=$(json_get '.session_id')
+        [ -n "$claude_session_id" ] && keys+=("$GROUP_PREFIX:$claude_session_id")
+        payload_cwd=$(json_get '.cwd')
+        handle=$(bounded 8 bash "$SELF" resolve "$payload_cwd" | head -1)
+        [ -n "$handle" ] && keys+=("$GROUP_PREFIX:${handle#*:}")
+    fi
+
+    # The directory-based key is never cleared: sibling tabs in one project share
+    # it, and one of them may still be waiting on you.
+    local key
+    for key in ${keys+"${keys[@]}"}; do
+        terminal-notifier -remove "$key" >/dev/null 2>&1
+    done
+}
+
+# ----------------------------------------------------------------- focus ----
+
+cmd_focus() {
+    local handle="${1:-}"
+    local kind="${handle%%:*}"
+    local target="${handle#*:}"
+    local result="notfound" bundle=""
+
+    case "$kind" in
+        iterm)    result=$(focus_iterm "$target");        bundle="com.googlecode.iterm2" ;;
+        terminal) result=$(focus_terminal_app "$target"); bundle="com.apple.Terminal" ;;
+        ghostty)  result=$(focus_ghostty "$target");      bundle="com.mitchellh.ghostty" ;;
+    esac
+
+    # The tab is gone or was never ours; raising the app is the best left.
+    [ "$result" = "ok" ] || [ -z "$bundle" ] || open -b "$bundle"
+
+    bash "$SELF" clear "$handle" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- doctor ----
+
+doctor_alert_style() {
+    /usr/bin/python3 - "$TERMINAL_NOTIFIER_BUNDLE_ID" <<'PY' 2>/dev/null
+import os, plistlib, subprocess, sys
+target = sys.argv[1]
+path = os.path.expanduser("~/Library/Preferences/com.apple.ncprefs.plist")
+raw = subprocess.run(["plutil", "-convert", "xml1", "-o", "-", path],
+                     capture_output=True).stdout
+names = {0: "None", 1: "Banners", 2: "Alerts"}
+for app in plistlib.loads(raw).get("apps", []):
+    bundle_id = app.get("bundle-id", "")
+    if "terminal-notifier" not in bundle_id:
+        continue
+    flags = app.get("flags")
+    style = names.get((flags >> 3) & 3, "?") if isinstance(flags, int) else "?"
+    mark = "  <- the one this tool posts through" if bundle_id == target else ""
+    print(f"    {bundle_id}: {style}{mark}")
+PY
+}
+
+cmd_doctor() {
+    local ok=0
+
+    echo "claude-code-tab-notify doctor"
+    echo "  executable: $SELF"
+
+    if is_macos; then
+        echo "  [ok]   macOS"
+    else
+        echo "  [FAIL] not macOS; this tool does nothing here"
+        ok=1
+    fi
+
+    if have_notifier; then
+        echo "  [ok]   terminal-notifier: $(command -v terminal-notifier)"
+    else
+        echo "  [FAIL] terminal-notifier missing. Install it: brew install terminal-notifier"
+        ok=1
+    fi
+
+    echo "  terminals running:"
+    local app
+    for app in iTerm2 Terminal Ghostty; do
+        if app_running "$app"; then echo "    $app: yes"; else echo "    $app: no"; fi
+    done
+
+    local info handle name
+    info=$(bounded 8 bash "$SELF" resolve "$(pwd)")
+    handle=$(echo "$info" | head -1)
+    name=$(echo "$info" | sed -n 2p)
+    if [ -n "$handle" ]; then
+        echo "  [ok]   this session resolves to a tab: $handle"
+        echo "         tab name: $name"
+    else
+        echo "  [warn] this session does not resolve to a tab."
+        echo "         Notifications still post and raise your terminal, without selecting a tab."
+        echo "         Warp has no scripting support, and Ghostty can only be matched when one"
+        echo "         tab is open on this directory."
+    fi
+
+    local settings="$HOME/.claude/settings.json"
+    if [ -f "$settings" ] && grep -q "claude-code-tab-notify" "$settings" 2>/dev/null; then
+        echo "  [ok]   hooks registered in $settings"
+    else
+        echo "  [FAIL] hooks not registered. Run ./install.sh"
+        ok=1
+    fi
+
+    echo "  alert style (System Settings > Notifications):"
+    local styles
+    styles=$(doctor_alert_style)
+    if [ -n "$styles" ]; then
+        echo "$styles"
+        echo "    Alerts stay on screen until dismissed; Banners fade after a few seconds."
+    else
+        echo "    could not read com.apple.ncprefs.plist"
+    fi
+
+    return $ok
+}
+
+# ------------------------------------------------------------------ main ----
+
+# Sourcing runs no command, so the test suite can call the per-terminal
+# functions directly instead of reimplementing them.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    case "${1:-help}" in
+        notify)  cmd_notify ;;
+        clear)   shift; cmd_clear "${1:-}" ;;
+        focus)   shift; cmd_focus "${1:-}" ;;
+        resolve) shift; resolve_handle "${1:-}" ;;
+        doctor)  cmd_doctor ;;
+        *)       sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+    esac
+fi
