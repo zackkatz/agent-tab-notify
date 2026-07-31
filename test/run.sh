@@ -133,8 +133,10 @@ rm -rf "$stub"
 # Two sessions with no tab and no tty must still not overwrite each other; the
 # Claude session id is the only thing left to tell them apart.
 stub=$(make_stub notty)
-payload Notification "session A" sid-aaa | PATH="$stub:$PATH" bash "$EXE" notify
-payload Notification "session B" sid-bbb | PATH="$stub:$PATH" bash "$EXE" notify
+# CCTN_ALWAYS_NOTIFY because a session with no tty is otherwise skipped when
+# iTerm's integration is installed; this test is about grouping, not the skip.
+payload Notification "session A" sid-aaa | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+payload Notification "session B" sid-bbb | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
 ga=$(arg_of "$stub" -group 1); gb=$(arg_of "$stub" -group 2)
 if [ -n "$ga" ] && [ "$ga" != "$gb" ]; then ok "two sessions get different groups"
 else fail "two sessions get different groups" "got [$ga] and [$gb]"; fi
@@ -145,7 +147,7 @@ rm -rf "$stub"
 stub=$(make_stub notty)
 for msg in "collide A" "collide B"; do
     printf '{"hook_event_name":"Notification","message":"%s","cwd":"%s"}' "$msg" "$PWD" \
-        | PATH="$stub:$PATH" bash "$EXE" notify
+        | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
 done
 ga=$(arg_of "$stub" -group 1); gb=$(arg_of "$stub" -group 2)
 if [ -n "$ga" ] && [ "$ga" = "$gb" ]; then ok "without a session id they do collide (tamper check)"
