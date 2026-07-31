@@ -185,7 +185,13 @@ if [ -n "$tty" ]; then
 
     stub=$(make_stub noresolve)
     payload Notification "degraded" sid-degraded | PATH="$stub:$PATH" bash "$EXE" notify
-    check "click target falls back to the tty" "'$EXE' focus 'tty:$tty'" "$(arg_of "$stub" -execute)"
+    # The command is detached because terminal-notifier exits within ~120ms of
+    # being relaunched to handle the click, faster than one AppleScript round trip.
+    got_exec=$(arg_of "$stub" -execute)
+    case "$got_exec" in
+        "nohup "*"focus 'tty:$tty'"*"&") ok "click target falls back to the tty, detached" ;;
+        *) fail "click target falls back to the tty, detached" "got [$got_exec]" ;;
+    esac
     check "reuses the last known tab name" "CACHED TAB NAME" "$(arg_of "$stub" -subtitle)"
     rm -rf "$stub"
 

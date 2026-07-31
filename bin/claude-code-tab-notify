@@ -443,7 +443,10 @@ except Exception:
     )
 
     if [ -n "$handle" ]; then
-        args+=(-execute "'$SELF' focus '$handle'")
+        # terminal-notifier is relaunched to handle the click and exits within
+        # ~120ms, which is less than one AppleScript round trip. Run detached so
+        # selecting the tab outlives the process that started it.
+        args+=(-execute "nohup '$SELF' focus '$handle' >/dev/null 2>&1 &")
     elif [ -n "$fallback_app" ]; then
         args+=(-activate "$fallback_app")
     fi
@@ -512,8 +515,6 @@ cmd_focus() {
 
     # The tab is gone or was never ours; raising the app is the best left.
     [ "$result" = "ok" ] || [ -z "$bundle" ] || open -b "$bundle"
-
-    bash "$SELF" clear "$handle" 2>/dev/null
 }
 
 # ---------------------------------------------------------------- doctor ----
