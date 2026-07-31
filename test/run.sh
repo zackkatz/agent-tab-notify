@@ -193,6 +193,25 @@ else
 fi
 echo
 
+echo "unroutable sessions"
+if grep -q 'iterm2/cc-status' "$HOME/.claude/settings.json" 2>/dev/null; then
+    stub=$(make_stub notty)
+    printf '{"hook_event_name":"Stop","message":"x","cwd":"%s","session_id":"bg1"}' "$PWD" \
+        | env -u TERM_PROGRAM -u ITERM_SESSION_ID CLAUDE_CODE_SESSION_KIND=bg \
+              PATH="$stub:$PATH" bash "$EXE" notify
+    check "skips a notification it cannot route when iTerm's integration is installed" \
+          "0" "$(call_count "$stub")"
+
+    printf '{"hook_event_name":"Stop","message":"x","cwd":"%s","session_id":"bg1"}' "$PWD" \
+        | env -u TERM_PROGRAM -u ITERM_SESSION_ID CLAUDE_CODE_SESSION_KIND=bg \
+              CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+    check "CCTN_ALWAYS_NOTIFY overrides the skip" "1" "$(call_count "$stub")"
+    rm -rf "$stub"
+else
+    skip "unroutable session tests" "iTerm's cc-status integration not installed"
+fi
+echo
+
 # ----------------------------------------------------------------- clear ---
 echo "clear"
 stub=$(make_stub)

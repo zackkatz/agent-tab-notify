@@ -83,6 +83,14 @@ Identifying the tab is the part worth explaining. In iTerm, `$ITERM_SESSION_ID` 
 
 Rather than trusting `$TERM_PROGRAM`, which is absent from some hook environments for the same reasons, each running terminal is asked in turn whether it owns this session. Every identifier handed to a notification resolved against a live tab, so a click can never target a tab that no longer exists.
 
+## Background sessions
+
+Claude Code background sessions run under its daemon rather than in a tab. They have no tty, and the terminal session id they inherit points at whichever tab launched them, which is often closed. No tab exists to switch to, and nothing in Claude's job metadata records where you are watching one.
+
+Those notifications say `background job: <name>`, read in full from the job's own state file, since the name is the only thing identifying which job woke you.
+
+If iTerm2's Claude Code integration is installed, which its own setup detects by looking for `cc-status` in your hooks, notifications that cannot route anywhere are skipped entirely. iTerm posts a working one for those sessions, so a second one that does nothing on click is noise. Set `CCTN_ALWAYS_NOTIFY=1` to post them anyway.
+
 ## Known limits
 
 Sessions that cannot be matched to a tab fall back to Claude's own session id for grouping, and to the working directory if that is also absent. In the directory case, sibling tabs in one project share a group and overwrite each other's notifications.

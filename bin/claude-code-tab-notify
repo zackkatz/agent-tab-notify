@@ -413,6 +413,20 @@ except Exception:
     # This failure is intermittent and only reproduces under real load across
     # several sessions, so record what each post decided. Without it the only
     # evidence is a notification that already happened.
+    # A notification with no handle cannot route anywhere: no tab, and no tty to
+    # work one out from later. iTerm2's own integration posts a working one for
+    # exactly these sessions, so ours would be a duplicate that does nothing when
+    # clicked. Only skip when that integration is installed, since on any other
+    # machine a notification that merely raises the terminal still beats silence.
+    local iterm_integration=""
+    grep -q 'iterm2/cc-status' "$HOME/.claude/settings.json" 2>/dev/null && iterm_integration=1
+    if [ -z "$handle" ] && [ -n "$iterm_integration" ] && [ -z "${CCTN_ALWAYS_NOTIFY:-}" ]; then
+        printf '%s event=%s session=%s SKIPPED (unroutable; iTerm integration active)\n' \
+            "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" \
+            >> "${TMPDIR:-/tmp}/cctn.log" 2>/dev/null
+        exit 0
+    fi
+
     local log="${TMPDIR:-/tmp}/cctn.log"
     printf '%s event=%s session=%s tty=%s handle=%s title=%s\n' \
         "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" \
