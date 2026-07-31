@@ -342,7 +342,21 @@ cmd_notify() {
     # there is no tab to select and no point paying for the lookup. Say so in
     # the notification instead of leaving it looking like a failed resolution.
     if [ "${CLAUDE_CODE_SESSION_KIND:-}" = "bg" ] || [ -n "${CLAUDE_JOB_DIR:-}" ]; then
-        tab_title="background job${CLAUDE_CODE_SESSION_NAME:+: $CLAUDE_CODE_SESSION_NAME}"
+        # $CLAUDE_CODE_SESSION_NAME is truncated to one word ("Evaluate"), while
+        # the job's own state file carries the whole name. With no tab to name,
+        # this is the only thing that says which job woke you.
+        local job_name=""
+        if [ -f "${CLAUDE_JOB_DIR:-}/state.json" ]; then
+            job_name=$(/usr/bin/python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("name", "") or "")
+except Exception:
+    print("")
+' "$CLAUDE_JOB_DIR/state.json" 2>/dev/null)
+        fi
+        [ -n "$job_name" ] || job_name="${CLAUDE_CODE_SESSION_NAME:-}"
+        tab_title="background job${job_name:+: $job_name}"
     else
         info=$(bounded 8 bash "$SELF" resolve "$payload_cwd")
         handle=$(echo "$info" | head -1)
