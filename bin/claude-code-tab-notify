@@ -20,6 +20,10 @@ SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
 # Overridable so the test suite can post without touching real notifications.
 GROUP_PREFIX="${CCTN_GROUP_PREFIX:-claude-code-tab-notify}"
 
+# iTerm2's own Claude Code integration posts its own notifications, so a title
+# prefix is the only way to tell at a glance which one you are looking at.
+TITLE_PREFIX="${CCTN_TITLE_PREFIX:-cctn: }"
+
 TERMINAL_NOTIFIER_BUNDLE_ID="fr.julienxx.oss.terminal-notifier"
 
 # A handle is "<terminal>:<identifier>". Each terminal offers a different
@@ -27,6 +31,12 @@ TERMINAL_NOTIFIER_BUNDLE_ID="fr.julienxx.oss.terminal-notifier"
 #   iterm:<session uuid>     stable per session
 #   terminal:<tty>           Terminal.app exposes tty per tab
 #   ghostty:<tab id>         matched by working directory, only when unambiguous
+#   tty:<tty>                unresolved; the click works out which terminal owns it
+#
+# The tty handle exists because asking a terminal anything requires AppleScript,
+# which can stall under load while several sessions post at once. Reading the tty
+# costs no AppleScript at all, so a notification always carries something the
+# click can act on, and the lookup happens when you click instead of when it posts.
 
 # ---------------------------------------------------------------- helpers ---
 
@@ -331,6 +341,23 @@ cmd_notify() {
     tab_title=$(echo "$info" | sed -n 2p)
     claude_session_id=$(json_get '.session_id')
 
+    # Resolution can come back empty when a terminal is slow to answer, which
+    # says nothing about whether the tab exists. Fall back to the raw tty so the
+    # click still has somewhere to go, and reuse the last known tab name so the
+    # notification can still say which tab it is.
+    local raw_tty cache
+    raw_tty=$(session_tty)
+    cache="${TMPDIR:-/tmp}/cctn-tabnames"
+    mkdir -p "$cache" 2>/dev/null
+    local cache_file="$cache/$(echo "${raw_tty:-none}" | tr '/' '_')"
+
+    if [ -z "$handle" ]; then
+        [ -n "$raw_tty" ] && handle="tty:$raw_tty"
+        [ -z "$tab_title" ] && [ -f "$cache_file" ] && tab_title=$(cat "$cache_file")
+    elif [ -n "$tab_title" ] && [ -n "$raw_tty" ]; then
+        printf '%s' "$tab_title" > "$cache_file" 2>/dev/null
+    fi
+
     # Claude's own session id keeps sibling tabs in one project distinct when no
     # tab resolves. Falling back to the directory collapses them.
     local group_id="${handle#*:}"
@@ -347,9 +374,32 @@ cmd_notify() {
         ghostty)        fallback_app="com.mitchellh.ghostty" ;;
     esac
 
+    # Sessions started outside a terminal (parented by launchd rather than a tab)
+    # have neither a tty nor TERM_PROGRAM, which left their notifications with no
+    # click action at all: clicking did nothing whatsoever. Raising the only
+    # running terminal is a guess, so make it only when there is nothing to guess
+    # between.
+    if [ -z "$handle" ] && [ -z "$fallback_app" ]; then
+        local running=() app
+        for app in iTerm2:com.googlecode.iterm2 Terminal:com.apple.Terminal \
+                   Ghostty:com.mitchellh.ghostty; do
+            app_running "${app%%:*}" && running+=("${app#*:}")
+        done
+        [ "${#running[@]}" -eq 1 ] && fallback_app="${running[0]}"
+    fi
+
+    # This failure is intermittent and only reproduces under real load across
+    # several sessions, so record what each post decided. Without it the only
+    # evidence is a notification that already happened.
+    local log="${TMPDIR:-/tmp}/cctn.log"
+    printf '%s event=%s session=%s tty=%s handle=%s title=%s\n' \
+        "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" \
+        "${raw_tty:-none}" "${handle:-NONE}" "${tab_title:-NONE}" >> "$log" 2>/dev/null
+    tail -300 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log" 2>/dev/null
+
     local args
     args=(
-        -title "Claude Code ($session_dir)"
+        -title "${TITLE_PREFIX}Claude Code ($session_dir)"
         -subtitle "${tab_title:-$title}"
         -message "$msg"
         -sound "$sound"
@@ -375,12 +425,16 @@ cmd_clear() {
         keys+=("$GROUP_PREFIX:${1#*:}")
     else
         read_stdin
-        local claude_session_id payload_cwd handle
+        local claude_session_id payload_cwd handle raw_tty
         claude_session_id=$(json_get '.session_id')
         [ -n "$claude_session_id" ] && keys+=("$GROUP_PREFIX:$claude_session_id")
         payload_cwd=$(json_get '.cwd')
         handle=$(bounded 8 bash "$SELF" resolve "$payload_cwd" | head -1)
         [ -n "$handle" ] && keys+=("$GROUP_PREFIX:${handle#*:}")
+        # A notification posted while resolution was slow is keyed by tty, which
+        # is a different key than the same tab's resolved id.
+        raw_tty=$(session_tty)
+        [ -n "$raw_tty" ] && keys+=("$GROUP_PREFIX:$raw_tty")
     fi
 
     # The directory-based key is never cleared: sibling tabs in one project share
@@ -403,6 +457,21 @@ cmd_focus() {
         iterm)    result=$(focus_iterm "$target");        bundle="com.googlecode.iterm2" ;;
         terminal) result=$(focus_terminal_app "$target"); bundle="com.apple.Terminal" ;;
         ghostty)  result=$(focus_ghostty "$target");      bundle="com.mitchellh.ghostty" ;;
+        tty)
+            # Deferred lookup: work out which terminal owns this tty now.
+            # ITERM_SESSION_ID must be cleared: it describes whoever is running
+            # this lookup, and letting it win would focus their tab, not the one
+            # the notification is about.
+            local found
+            found=$(ITERM_SESSION_ID= resolve_iterm "$target" | head -1)
+            if [ -n "$found" ]; then
+                result=$(focus_iterm "${found#*:}")
+                bundle="com.googlecode.iterm2"
+            elif [ -n "$(resolve_terminal_app "$target" | head -1)" ]; then
+                result=$(focus_terminal_app "$target")
+                bundle="com.apple.Terminal"
+            fi
+            ;;
     esac
 
     # The tab is gone or was never ours; raising the app is the best left.

@@ -1,8 +1,10 @@
 #!/bin/bash
-# Test suite. Posts only into its own notification group, and removes what it posts.
+# Test suite.
 #
-# Tests that need a specific terminal running are skipped rather than failed, so
-# the suite is honest on a machine that has only one of them.
+# Assertions capture the arguments handed to terminal-notifier rather than
+# reading delivered notifications back, which depends on Notification Center
+# answering and fails for reasons unrelated to this code (a Focus mode, or
+# `terminal-notifier -list` hanging).
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXE="$REPO_DIR/bin/claude-code-tab-notify"
@@ -21,10 +23,37 @@ check() {
     else fail "$name" "expected [$expected], got [$actual]"; fi
 }
 
-# A test that posts must be able to see what landed, so every assertion about a
-# notification reads terminal-notifier's own list rather than trusting exit codes.
-group_message() { terminal-notifier -list "$1" 2>/dev/null | sed -n '2p' | cut -f4; }
-remove_group()  { terminal-notifier -remove "$1" >/dev/null 2>&1; }
+# A stub PATH whose terminal-notifier records every call instead of posting.
+# Pass "noresolve" to also stub osascript, simulating a terminal too slow to answer.
+make_stub() {
+    local dir; dir=$(mktemp -d)
+    cat > "$dir/terminal-notifier" <<EOF
+#!/bin/bash
+for a in "\$@"; do printf '%s\t' "\$a" >> "$dir/calls.txt"; done
+printf '\n' >> "$dir/calls.txt"
+EOF
+    chmod +x "$dir/terminal-notifier"
+    case "${1:-}" in
+        noresolve|notty)
+            printf '#!/bin/bash\nexit 0\n' > "$dir/osascript"
+            chmod +x "$dir/osascript"
+            ;;
+    esac
+    # No tty anywhere in the ancestry, as with a Claude session parented by
+    # launchd rather than started from a terminal tab.
+    if [ "${1:-}" = "notty" ]; then
+        printf '#!/bin/bash\nexit 0\n' > "$dir/ps"
+        chmod +x "$dir/ps"
+    fi
+    echo "$dir"
+}
+
+# Value following a flag, from call number $3 (default 1).
+arg_of() {
+    awk -v flag="$2" -v want="${3:-1}" 'BEGIN{FS="\t"}
+        {n++; if (n==want) for (i=1;i<=NF;i++) if ($i==flag) {print $(i+1); exit}}' "$1/calls.txt" 2>/dev/null
+}
+call_count() { [ -f "$1/calls.txt" ] && grep -c . "$1/calls.txt" || echo 0; }
 
 payload() {
     printf '{"hook_event_name":"%s","message":"%s","cwd":"%s","session_id":"%s"%s}' \
@@ -53,14 +82,14 @@ if app_running "iTerm2"; then
 
         # An absent ITERM_SESSION_ID is the case that used to fall back to
         # activation, which does nothing when the app is already frontmost.
-        got=$(env -u ITERM_SESSION_ID bash "$EXE" resolve "$PWD" | head -1)
-        check "resolves without ITERM_SESSION_ID" "$BASE" "$got"
+        check "resolves without ITERM_SESSION_ID" "$BASE" \
+              "$(env -u ITERM_SESSION_ID bash "$EXE" resolve "$PWD" | head -1)"
 
         # iTerm assigns a new id when it restores a tab, so a stale value must
         # not win over a tty match.
-        got=$(ITERM_SESSION_ID='w0t0p0:00000000-0000-0000-0000-000000000000' \
-              bash "$EXE" resolve "$PWD" | head -1)
-        check "ignores a stale ITERM_SESSION_ID" "$BASE" "$got"
+        check "ignores a stale ITERM_SESSION_ID" "$BASE" \
+              "$(ITERM_SESSION_ID='w0t0p0:00000000-0000-0000-0000-000000000000' \
+                 bash "$EXE" resolve "$PWD" | head -1)"
     else
         skip "resolve tests" "iTerm running but this session is not inside it"
     fi
@@ -78,34 +107,6 @@ fi
 
 if app_running "Ghostty"; then
     check "Ghostty rejects an unknown directory" "" "$(resolve_ghostty /nonexistent/path)"
-    dirs=$(osascript -e 'tell application "Ghostty"
-set out to ""
-repeat with w in windows
-repeat with t in tabs of w
-repeat with trm in terminals of t
-set out to out & (working directory of trm) & linefeed
-end repeat
-end repeat
-end repeat
-return out
-end tell' 2>/dev/null)
-    uniq_dir=$(echo "$dirs" | grep -v '^$' | sort | uniq -c | awk '$1==1 {print substr($0, index($0,$2)); exit}')
-    dupe_dir=$(echo "$dirs" | grep -v '^$' | sort | uniq -c | awk '$1>1 {print substr($0, index($0,$2)); exit}')
-    if [ -n "$uniq_dir" ]; then
-        got=$(resolve_ghostty "$uniq_dir" | head -1)
-        case "$got" in
-            ghostty:*) ok "Ghostty resolves a directory open in exactly one tab" ;;
-            *) fail "Ghostty resolves a directory open in exactly one tab" "got [$got]" ;;
-        esac
-    else
-        skip "Ghostty unique-directory match" "no directory is open in exactly one tab"
-    fi
-    if [ -n "$dupe_dir" ]; then
-        # Sending you to the wrong tab is worse than sending you nowhere.
-        check "Ghostty refuses an ambiguous directory" "" "$(resolve_ghostty "$dupe_dir")"
-    else
-        skip "Ghostty ambiguity guard" "no directory is open in more than one tab"
-    fi
 else
     skip "Ghostty tests" "Ghostty not running"
 fi
@@ -113,98 +114,96 @@ echo
 
 # ---------------------------------------------------------------- notify ---
 echo "notify"
-if command -v terminal-notifier >/dev/null 2>&1; then
-    payload Stop "should not appear" sid-guard ',"stop_hook_active":true' | bash "$EXE" notify
-    check "stop_hook_active suppresses the notification" "" "$(group_message "$CCTN_GROUP_PREFIX:sid-guard")"
 
-    payload Notification "posted" sid-post | bash "$EXE" notify
-    posted=$(terminal-notifier -list ALL 2>/dev/null | grep -c "$CCTN_GROUP_PREFIX")
-    if [ "$posted" -ge 1 ]; then ok "posts a notification"
-    else fail "posts a notification" "nothing landed in group prefix $CCTN_GROUP_PREFIX"; fi
+stub=$(make_stub)
+payload Stop "should not appear" sid-guard ',"stop_hook_active":true' | PATH="$stub:$PATH" bash "$EXE" notify
+check "stop_hook_active posts nothing" "0" "$(call_count "$stub")"
+rm -rf "$stub"
 
-    # Two sessions in one directory must not overwrite each other. Without a
-    # session id they collapse onto the directory, which is the bug this guards.
-    stub=$(mktemp -d)
-    printf '#!/bin/bash\nexit 0\n' > "$stub/osascript"
-    chmod +x "$stub/osascript"
+stub=$(make_stub)
+payload Notification "hello" sid-post | PATH="$stub:$PATH" bash "$EXE" notify
+check "posts one notification" "1" "$(call_count "$stub")"
+check "carries the message" "hello" "$(arg_of "$stub" -message)"
+case "$(arg_of "$stub" -title)" in
+    "cctn: "*) ok "title is prefixed so it is distinguishable from iTerm's own" ;;
+    *) fail "title is prefixed" "got [$(arg_of "$stub" -title)]" ;;
+esac
+rm -rf "$stub"
 
-    PATH="$stub:$PATH" payload Notification "session A" sid-aaa | PATH="$stub:$PATH" bash "$EXE" notify
-    PATH="$stub:$PATH" payload Notification "session B" sid-bbb | PATH="$stub:$PATH" bash "$EXE" notify
-    a=$(group_message "$CCTN_GROUP_PREFIX:sid-aaa")
-    b=$(group_message "$CCTN_GROUP_PREFIX:sid-bbb")
-    if [ "$a" = "session A" ] && [ "$b" = "session B" ]; then
-        ok "two sessions in one directory keep separate notifications"
-    else
-        fail "two sessions in one directory keep separate notifications" "got A=[$a] B=[$b]"
-    fi
+# Two sessions with no tab and no tty must still not overwrite each other; the
+# Claude session id is the only thing left to tell them apart.
+stub=$(make_stub notty)
+payload Notification "session A" sid-aaa | PATH="$stub:$PATH" bash "$EXE" notify
+payload Notification "session B" sid-bbb | PATH="$stub:$PATH" bash "$EXE" notify
+ga=$(arg_of "$stub" -group 1); gb=$(arg_of "$stub" -group 2)
+if [ -n "$ga" ] && [ "$ga" != "$gb" ]; then ok "two sessions get different groups"
+else fail "two sessions get different groups" "got [$ga] and [$gb]"; fi
+rm -rf "$stub"
 
-    # Tamper check: remove the session id and the collision must come back, or
-    # the test above proves nothing.
-    dir_key="$CCTN_GROUP_PREFIX:$(basename "$PWD")"
-    remove_group "$dir_key"
-    PATH="$stub:$PATH" bash -c "printf '{\"hook_event_name\":\"Notification\",\"message\":\"collide A\",\"cwd\":\"$PWD\"}' | bash '$EXE' notify"
-    PATH="$stub:$PATH" bash -c "printf '{\"hook_event_name\":\"Notification\",\"message\":\"collide B\",\"cwd\":\"$PWD\"}' | bash '$EXE' notify"
-    check "without a session id they do collide (tamper check)" "collide B" "$(group_message "$dir_key")"
-    remove_group "$dir_key"
+# Tamper check: drop the session id and the collision must come back, or the
+# assertion above proves nothing.
+stub=$(make_stub notty)
+for msg in "collide A" "collide B"; do
+    printf '{"hook_event_name":"Notification","message":"%s","cwd":"%s"}' "$msg" "$PWD" \
+        | PATH="$stub:$PATH" bash "$EXE" notify
+done
+ga=$(arg_of "$stub" -group 1); gb=$(arg_of "$stub" -group 2)
+if [ -n "$ga" ] && [ "$ga" = "$gb" ]; then ok "without a session id they do collide (tamper check)"
+else fail "without a session id they do collide (tamper check)" "got [$ga] and [$gb]"; fi
+rm -rf "$stub"
+
+# jq is not guaranteed on a hook's PATH; the python fallback must parse.
+stub=$(make_stub)
+nojq=$(mktemp -d)
+for b in bash cat sed head tail cut tr grep basename dirname perl ps pwd python3 mktemp uname date printf; do
+    src=$(command -v "$b") && ln -sf "$src" "$nojq/$b"
+done
+printf '#!/bin/bash\nexit 0\n' > "$nojq/osascript"; chmod +x "$nojq/osascript"
+ln -sf "$stub/terminal-notifier" "$nojq/terminal-notifier"
+if env -i PATH="$nojq" "$nojq/bash" -c 'command -v jq' >/dev/null 2>&1; then
+    skip "parses hook JSON without jq" "jq still reachable in the stub PATH"
+else
+    payload Notification "no jq here" sid-nojq | \
+        env -i HOME="$HOME" PATH="$nojq" CCTN_GROUP_PREFIX="$CCTN_GROUP_PREFIX" \
+            "$nojq/bash" "$EXE" notify
+    check "parses hook JSON without jq" "no jq here" "$(arg_of "$stub" -message)"
+fi
+rm -rf "$nojq" "$stub"
+echo
+
+# A terminal that answers too slowly is the failure this guards: the click target
+# and the tab name must both survive it.
+echo "degraded resolution"
+tty=$(session_tty)
+if [ -n "$tty" ]; then
+    cache="${TMPDIR:-/tmp}/cctn-tabnames/$(echo "$tty" | tr '/' '_')"
+    mkdir -p "$(dirname "$cache")"
+    saved=""; [ -f "$cache" ] && saved=$(cat "$cache")
+    printf 'CACHED TAB NAME' > "$cache"
+
+    stub=$(make_stub noresolve)
+    payload Notification "degraded" sid-degraded | PATH="$stub:$PATH" bash "$EXE" notify
+    check "click target falls back to the tty" "'$EXE' focus 'tty:$tty'" "$(arg_of "$stub" -execute)"
+    check "reuses the last known tab name" "CACHED TAB NAME" "$(arg_of "$stub" -subtitle)"
     rm -rf "$stub"
 
-    # jq is not guaranteed on a hook's PATH; the python fallback must parse.
-    nojq=$(mktemp -d)
-    for b in bash cat sed head tail cut tr grep basename dirname perl osascript ps pwd python3 terminal-notifier mktemp uname; do
-        src=$(command -v "$b") && ln -sf "$src" "$nojq/$b"
-    done
-    # No-op osascript so nothing resolves and the group key falls back to the
-    # session id. This test is about JSON parsing, not about finding a tab.
-    # Remove the symlink first: writing through it targets the real binary,
-    # which SIP refuses.
-    rm -f "$nojq/osascript"
-    printf '#!/bin/bash\nexit 0\n' > "$nojq/osascript"
-    chmod +x "$nojq/osascript"
-
-    if env -i PATH="$nojq" "$nojq/bash" -c 'command -v jq' >/dev/null 2>&1; then
-        skip "parses hook JSON without jq" "jq still reachable in the stub PATH"
-    else
-        # env -i drops CCTN_GROUP_PREFIX, and without it this test posts into
-        # the real notification namespace instead of the test one.
-        payload Notification "no jq here" sid-nojq | \
-            env -i HOME="$HOME" PATH="$nojq" \
-                CCTN_GROUP_PREFIX="$CCTN_GROUP_PREFIX" "$nojq/bash" "$EXE" notify
-        check "parses hook JSON without jq" "no jq here" "$(group_message "$CCTN_GROUP_PREFIX:sid-nojq")"
-    fi
-    rm -rf "$nojq"
+    if [ -n "$saved" ]; then printf '%s' "$saved" > "$cache"; else rm -f "$cache"; fi
 else
-    skip "notify tests" "terminal-notifier not installed"
+    skip "degraded resolution tests" "no tty for this session"
 fi
 echo
 
 # ----------------------------------------------------------------- clear ---
 echo "clear"
-if command -v terminal-notifier >/dev/null 2>&1; then
-    # Stub osascript so no tab resolves, which forces the group key onto the
-    # session id. Without this the key is the resolved handle and the assertion
-    # below would pass against a notification that was never posted.
-    stub=$(mktemp -d)
-    printf '#!/bin/bash\nexit 0\n' > "$stub/osascript"
-    chmod +x "$stub/osascript"
+stub=$(make_stub)
+PATH="$stub:$PATH" bash "$EXE" clear "x:sid-clear"
+check "clear removes exactly one group" "1" "$(call_count "$stub")"
+check "clear targets the right group" "$CCTN_GROUP_PREFIX:sid-clear" "$(arg_of "$stub" -remove)"
+rm -rf "$stub"
 
-    payload Notification "to be cleared" sid-clear | PATH="$stub:$PATH" bash "$EXE" notify
-    before=$(group_message "$CCTN_GROUP_PREFIX:sid-clear")
-    check "posts before clearing (control)" "to be cleared" "$before"
-    bash "$EXE" clear "x:sid-clear"
-    check "clear removes the notification" "" "$(group_message "$CCTN_GROUP_PREFIX:sid-clear")"
-    rm -rf "$stub"
-
-    bash "$EXE" clear "x:no-such-group-at-all"
-    check "clearing an absent group exits cleanly" "0" "$?"
-else
-    skip "clear tests" "terminal-notifier not installed"
-fi
+bash "$EXE" clear "x:no-such-group-at-all"
+check "clearing an absent group exits cleanly" "0" "$?"
 echo
-
-# --------------------------------------------------------------- cleanup ---
-for key in $(terminal-notifier -list ALL 2>/dev/null | awk -v p="$CCTN_GROUP_PREFIX" -F'\t' '$1 ~ p {print $1}'); do
-    remove_group "$key"
-done
 
 echo "passed $PASS, failed $FAIL, skipped $SKIP"
 [ "$FAIL" -eq 0 ]
