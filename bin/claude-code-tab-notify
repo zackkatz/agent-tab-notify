@@ -335,11 +335,19 @@ cmd_notify() {
             ;;
     esac
 
-    local info handle tab_title claude_session_id
-    info=$(bounded 8 bash "$SELF" resolve "$payload_cwd")
-    handle=$(echo "$info" | head -1)
-    tab_title=$(echo "$info" | sed -n 2p)
+    local info="" handle="" tab_title="" claude_session_id
     claude_session_id=$(json_get '.session_id')
+
+    # Background sessions run under Claude's daemon rather than in a tab, so
+    # there is no tab to select and no point paying for the lookup. Say so in
+    # the notification instead of leaving it looking like a failed resolution.
+    if [ "${CLAUDE_CODE_SESSION_KIND:-}" = "bg" ] || [ -n "${CLAUDE_JOB_DIR:-}" ]; then
+        tab_title="background job${CLAUDE_CODE_SESSION_NAME:+: $CLAUDE_CODE_SESSION_NAME}"
+    else
+        info=$(bounded 8 bash "$SELF" resolve "$payload_cwd")
+        handle=$(echo "$info" | head -1)
+        tab_title=$(echo "$info" | sed -n 2p)
+    fi
 
     # Resolution can come back empty when a terminal is slow to answer, which
     # says nothing about whether the tab exists. Fall back to the raw tty so the
