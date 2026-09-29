@@ -11,6 +11,14 @@
         <string>watch</string>
     </array>
 
+    <!-- launchd hands an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin, which does
+         not include Homebrew, where terminal-notifier lives. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>

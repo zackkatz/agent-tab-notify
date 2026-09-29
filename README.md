@@ -45,6 +45,8 @@ launchctl load -w ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.wat
 
 Copy `launchd/com.zackkatz.claude-code-tab-notify.watch.plist` there first, with the path inside it pointing at your checkout.
 
+macOS will ask once for permission to control iTerm2 (or Terminal) on the agent's behalf; until you allow it, the agent runs but clears nothing, and osascript fails without saying why. The agent logs that failure to `/tmp/cctn-watch.log`, so check there first if notifications stop clearing.
+
 It polls once a second. An idle tick reads the frontmost app and lists one directory, which is about 8ms and no AppleScript at all; it only asks iTerm or Terminal which tab is in front while a notification is actually outstanding. A notification that arrives for the tab you are already sitting in is left alone until you move away and come back, so nothing is cleared before you have seen it.
 
 iTerm2 and Terminal.app only. Ghostty and Warp expose no per-tab identifier, so the watcher cannot tell their tabs apart, and clearing the wrong tab's notification would lose the one thing waiting on you.

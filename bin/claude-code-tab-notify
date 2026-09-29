@@ -31,7 +31,10 @@ TERMINAL_NOTIFIER_BUNDLE_ID="fr.julienxx.oss.terminal-notifier"
 # instead of asking terminal-notifier, because `-list ALL` costs about 100ms
 # and a directory listing costs nothing. A stale marker is harmless: clearing a
 # notification that is no longer showing removes nothing.
-PENDING_DIR="${CCTN_PENDING_DIR:-${TMPDIR:-/tmp}/cctn-pending}"
+# Deliberately not under TMPDIR: hooks run with your shell's TMPDIR and the
+# watch agent runs under launchd with a different one, so the marker a hook
+# writes would land where the agent never looks.
+PENDING_DIR="${CCTN_PENDING_DIR:-$HOME/.cache/cctn-pending}"
 
 pending_path() {
     printf '%s/%s' "$PENDING_DIR" "$(printf '%s' "$1" | tr '/:' '__')"
@@ -641,27 +644,51 @@ watch_frontmost_bundle() {
 # Empty when the terminal cannot name its frontmost tab. Ghostty and Warp are
 # absent on purpose: neither exposes a per-tab identifier, and clearing the
 # wrong tab's notification loses the one thing that was waiting on you.
+# Errors are reported, never swallowed. Under launchd this call needs Automation
+# permission for the agent itself, and a denial is silent: osascript returns
+# nothing and the loop would look like it was simply finding no tabs.
+watch_say() {
+    [ -n "${CCTN_WATCH_QUIET:-}" ] && return 0
+    echo "$1" >&2
+}
+
+watch_ask() {
+    local out err rc
+    err=$(mktemp)
+    out=$(bounded 5 osascript -e "$1" 2>"$err"); rc=$?
+    if [ -n "$(cat "$err" 2>/dev/null)" ]; then
+        watch_say "watch: osascript failed ($(head -1 "$err"))"
+    fi
+    rm -f "$err"
+    [ $rc -eq 0 ] && printf '%s' "$out"
+}
+
 watch_frontmost_handle() {
     case "$1" in
         com.googlecode.iterm2)
             local id
-            id=$(bounded 5 osascript -e 'tell application "iTerm2" to tell current window to tell current tab to tell current session to get id' 2>/dev/null)
+            id=$(watch_ask 'tell application "iTerm2" to tell current window to tell current tab to tell current session to get id')
             [ -n "$id" ] && printf 'iterm:%s' "$id"
             ;;
         com.apple.Terminal)
             local tty
-            tty=$(bounded 5 osascript -e 'tell application "Terminal" to get tty of selected tab of front window' 2>/dev/null)
+            tty=$(watch_ask 'tell application "Terminal" to get tty of selected tab of front window')
             [ -n "$tty" ] && printf 'terminal:%s' "$tty"
             ;;
     esac
 }
 
 cmd_watch() {
-    have_notifier || exit 0
-    if ! command -v lsappinfo >/dev/null 2>&1; then
-        echo "watch needs lsappinfo, which ships with macOS" >&2
-        exit 1
-    fi
+    # A launchd agent gets PATH=/usr/bin:/bin:/usr/sbin:/sbin, which does not
+    # include Homebrew, so say what is missing rather than exiting quietly.
+    local dep
+    for dep in terminal-notifier lsappinfo osascript; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            echo "watch cannot start: $dep is not on PATH ($PATH)" >&2
+            exit 1
+        fi
+    done
+    echo "watch started, polling every ${WATCH_INTERVAL}s, markers in $PENDING_DIR" >&2
 
     local last_handle=""
     while :; do
