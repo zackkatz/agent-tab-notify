@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zackkatz.claude-code-tab-notify.watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/zackkatz/Local/dev/claude-code-tab-notify/bin/claude-code-tab-notify</string>
+        <string>watch</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- The loop idles at one lsappinfo call per second and asks AppleScript
+         nothing until a notification is actually outstanding, so throttling it
+         to the background band costs nothing and keeps it off the foreground
+         scheduler. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cctn-watch.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cctn-watch.log</string>
+</dict>
+</plist>

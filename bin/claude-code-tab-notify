@@ -5,6 +5,7 @@
 # Subcommands:
 #   notify    post a notification for this session   (Stop, Notification hooks)
 #   clear     drop this session's notification       (UserPromptSubmit hook)
+#   watch     clear a tab's notification when you switch to it (background)
 #   focus H   select the tab for handle H            (run by a notification click)
 #   resolve   print this session's handle, then its tab name
 #   doctor    check the pieces this depends on
@@ -25,6 +26,16 @@ GROUP_PREFIX="${CCTN_GROUP_PREFIX:-claude-code-tab-notify}"
 TITLE_PREFIX="${CCTN_TITLE_PREFIX:-cctn: }"
 
 TERMINAL_NOTIFIER_BUNDLE_ID="fr.julienxx.oss.terminal-notifier"
+
+# One marker file per outstanding notification. The watch loop reads this
+# instead of asking terminal-notifier, because `-list ALL` costs about 100ms
+# and a directory listing costs nothing. A stale marker is harmless: clearing a
+# notification that is no longer showing removes nothing.
+PENDING_DIR="${CCTN_PENDING_DIR:-${TMPDIR:-/tmp}/cctn-pending}"
+
+pending_path() {
+    printf '%s/%s' "$PENDING_DIR" "$(printf '%s' "$1" | tr '/:' '__')"
+}
 
 # A handle is "<terminal>:<identifier>". Each terminal offers a different
 # identifier, so the kind travels with it rather than being guessed on the way back.
@@ -385,6 +396,11 @@ except Exception:
     local group_id="${handle#*:}"
     local group_key="$GROUP_PREFIX:${group_id:-${claude_session_id:-$session_dir}}"
 
+    # Silent and non-fatal on purpose: the marker is an optimization for the
+    # watch loop, and a notification must still post on a system where this
+    # directory cannot be written.
+    { mkdir -p "$PENDING_DIR" && printf '%s' "$handle" > "$(pending_path "$group_key")"; } 2>/dev/null || true
+
     # Raising the wrong terminal would be worse than doing nothing, so an
     # unrecognized one gets no click action at all.
     local fallback_app=""
@@ -481,6 +497,7 @@ cmd_clear() {
     local key
     for key in ${keys+"${keys[@]}"}; do
         terminal-notifier -remove "$key" >/dev/null 2>&1
+        rm -f "$(pending_path "$key")" 2>/dev/null
     done
 }
 
@@ -599,6 +616,83 @@ cmd_doctor() {
     return $ok
 }
 
+# ----------------------------------------------------------------- watch ----
+
+# Claude Code fires no hook when you switch terminal tabs, so clearing a
+# notification on arrival, rather than on your first keystroke, needs a process
+# of its own.
+#
+# The loop is built to cost nothing while nothing is waiting on you. Reading the
+# frontmost app takes about 8ms and no AppleScript; asking iTerm which session is
+# frontmost takes about 146ms, so that question is only asked when a notification
+# is actually outstanding and a terminal that can answer it is in front. An idle
+# tick is one lsappinfo call and one directory listing.
+
+WATCH_INTERVAL="${CCTN_WATCH_INTERVAL:-1}"
+
+watch_frontmost_bundle() {
+    local asn
+    asn=$(lsappinfo front 2>/dev/null) || return 0
+    [ -n "$asn" ] || return 0
+    lsappinfo info -only bundleid "$asn" 2>/dev/null \
+        | sed -n 's/.*bundleID="\([^"]*\)".*/\1/p'
+}
+
+# Empty when the terminal cannot name its frontmost tab. Ghostty and Warp are
+# absent on purpose: neither exposes a per-tab identifier, and clearing the
+# wrong tab's notification loses the one thing that was waiting on you.
+watch_frontmost_handle() {
+    case "$1" in
+        com.googlecode.iterm2)
+            local id
+            id=$(bounded 5 osascript -e 'tell application "iTerm2" to tell current window to tell current tab to tell current session to get id' 2>/dev/null)
+            [ -n "$id" ] && printf 'iterm:%s' "$id"
+            ;;
+        com.apple.Terminal)
+            local tty
+            tty=$(bounded 5 osascript -e 'tell application "Terminal" to get tty of selected tab of front window' 2>/dev/null)
+            [ -n "$tty" ] && printf 'terminal:%s' "$tty"
+            ;;
+    esac
+}
+
+cmd_watch() {
+    have_notifier || exit 0
+    if ! command -v lsappinfo >/dev/null 2>&1; then
+        echo "watch needs lsappinfo, which ships with macOS" >&2
+        exit 1
+    fi
+
+    local last_handle=""
+    while :; do
+        sleep "$WATCH_INTERVAL"
+
+        # Nothing outstanding: the cheapest possible tick.
+        [ -d "$PENDING_DIR" ] || continue
+        local pending
+        pending=$(ls -1 "$PENDING_DIR" 2>/dev/null | head -1)
+        [ -n "$pending" ] || { last_handle=""; continue; }
+
+        local bundle handle
+        bundle=$(watch_frontmost_bundle)
+        case "$bundle" in
+            com.googlecode.iterm2|com.apple.Terminal) ;;
+            *) last_handle=""; continue ;;
+        esac
+
+        handle=$(watch_frontmost_handle "$bundle")
+        [ -n "$handle" ] || continue
+
+        # Only act when the frontmost tab changed. Sitting in one tab must not
+        # re-clear it every second, or a notification arriving for the tab you
+        # are already looking at would be wiped before you saw it.
+        [ "$handle" = "$last_handle" ] && continue
+        last_handle="$handle"
+
+        cmd_clear "$handle"
+    done
+}
+
 # ------------------------------------------------------------------ main ----
 
 # Sourcing runs no command, so the test suite can call the per-terminal
@@ -607,6 +701,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     case "${1:-help}" in
         notify)  cmd_notify ;;
         clear)   shift; cmd_clear "${1:-}" ;;
+        watch)   cmd_watch ;;
         focus)   shift; cmd_focus "${1:-}" ;;
         resolve) shift; resolve_handle "${1:-}" ;;
         doctor)  cmd_doctor ;;

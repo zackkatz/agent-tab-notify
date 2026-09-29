@@ -14,6 +14,8 @@ If you run Claude Code in more than one tab, you already know the problem. A not
 
 **It cleans up after itself.** Reaching a tab clears its notification, whether you clicked through or switched tabs and typed. Notification Center stops filling with alerts for work you already handled.
 
+**Switching to the tab is enough.** With the watcher running, arriving at a tab clears its notification straight away, without waiting for you to type. See [Clearing on tab switch](#clearing-on-tab-switch).
+
 **One notification per session.** A new alert replaces that session's previous one rather than stacking, and other sessions keep their own.
 
 **Quiet when nothing needs you.** Claude re-fires its stop hook when it continues from its own stop. That does not notify.
@@ -32,6 +34,22 @@ What a terminal exposes to AppleScript decides how well this can work.
 Ghostty exposes no tty and no per-tab environment variable, so the working directory is the only handle available. Two tabs open on one project cannot be told apart, and sending you to the wrong tab is worse than sending you nowhere, so a match counts only when it is unique. Warp ships no scripting dictionary at all, so its notifications raise the app and stop there.
 
 Sessions under VS Code's terminal, or any terminal not listed, get a notification that raises that app. When the terminal is unrecognized, the notification carries no click action rather than guessing and pulling you somewhere you were not working.
+
+## Clearing on tab switch
+
+Claude Code fires no hook when you switch terminal tabs, so the built-in clearing happens on your next keystroke in that tab. To clear on arrival instead, run the watcher:
+
+```bash
+launchctl load -w ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.watch.plist
+```
+
+Copy `launchd/com.zackkatz.claude-code-tab-notify.watch.plist` there first, with the path inside it pointing at your checkout.
+
+It polls once a second. An idle tick reads the frontmost app and lists one directory, which is about 8ms and no AppleScript at all; it only asks iTerm or Terminal which tab is in front while a notification is actually outstanding. A notification that arrives for the tab you are already sitting in is left alone until you move away and come back, so nothing is cleared before you have seen it.
+
+iTerm2 and Terminal.app only. Ghostty and Warp expose no per-tab identifier, so the watcher cannot tell their tabs apart, and clearing the wrong tab's notification would lose the one thing waiting on you.
+
+Stop it with `launchctl unload -w ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.watch.plist`, or run it in the foreground as `claude-code-tab-notify watch` to see what it does.
 
 ## Requirements
 
