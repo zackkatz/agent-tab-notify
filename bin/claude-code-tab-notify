@@ -470,7 +470,16 @@ except Exception:
         args+=(-activate "$fallback_app")
     fi
 
-    terminal-notifier "${args[@]}" >/dev/null 2>&1
+    # terminal-notifier can exit non-zero after posting. A hook that exits
+    # non-zero makes Claude Code report it as failed on every Stop, so record
+    # the status in the log instead of returning it.
+    local status=0
+    terminal-notifier "${args[@]}" >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf '%s event=%s session=%s terminal-notifier exited %s\n' \
+            "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" "$status" >> "$log" 2>/dev/null
+    fi
+    return 0
 }
 
 # ----------------------------------------------------------------- clear ----
