@@ -102,6 +102,8 @@ per posted notification and `clear` removes it.
 | `CCTN_WATCH_INTERVAL` | `1` | watch poll seconds |
 | `CCTN_WATCH_QUIET` | unset | silences watch's diagnostics |
 | `CCTN_ALWAYS_NOTIFY` | unset | overrides the unroutable-session skip |
+| `CCTN_AGENT` | unset | `codex` marks a Codex hook; a payload with `turn_id` counts too |
+| `CODEX_HOME` | `~/.codex` | where `install.sh` writes Codex's `hooks.json` and where the thread-name lookup reads `state_*.sqlite` |
 
 ## Claude Code hook wiring
 
@@ -116,6 +118,25 @@ this tool:
 | `UserPromptSubmit` | `clear` |
 
 The watch agent is separate and not installed by `install.sh`; see the README.
+
+## Codex hook wiring
+
+When `${CODEX_HOME:-~/.codex}` exists, `install.sh` also writes two entries to its
+`hooks.json`: `Stop` runs `notify` and `UserPromptSubmit` runs `clear`, each command
+prefixed `CCTN_AGENT=codex`.
+Codex runs a hook only after the user trusts it with `/hooks`; until then nothing fires and
+nothing reports why. `PermissionRequest` is left out because it fires before Codex's
+automatic reviewer decides.
+
+Codex runs hooks in one of two places, and the code has to tell them apart:
+
+- **In the tab's own `codex` process** (an in-process app server). A tty sits above the
+  hook and the environment is the tab's own, so the Claude path works unchanged.
+- **In the shared app-server daemon** (`codex app-server --managed-daemon`). No tty, and its
+  `ITERM_SESSION_ID` and `TMUX` belong to whichever tab started the daemon.
+  `forget_daemon_env` unsets them when no ancestor has a tty, and `resolve_codex_thread`
+  matches the iTerm tab whose name starts with the thread's `name` from
+  `state_*.sqlite`, only when exactly one tab matches.
 
 ## Extension patterns
 
@@ -188,7 +209,13 @@ covers syntax, resolution, notify, degraded resolution, unroutable sessions, and
 9. **A session that resolves to no tab is skipped when iTerm2's own Claude Code integration
    is active**, since that integration posts a working notification of its own and two would
    be worse than one. `CCTN_ALWAYS_NOTIFY=1` overrides it.
-10. **The script is safe to `source`** — the dispatch is guarded on `BASH_SOURCE`, so tests
+10. **`cctn.log` is capped at 300 lines, so its line count stops growing once full.** A
+    check that waits for `wc -l` to rise never sees a new entry. Match on the timestamp
+    or the session id instead.
+11. **A Codex session started from a script inherits that shell's `ITERM_SESSION_ID`**, and
+    runs hooks in-process with a tty, so it routes to the tab you launched it from. The
+    routing matches the environment it was given; test daemon routing under launchd instead.
+12. **The script is safe to `source`** — the dispatch is guarded on `BASH_SOURCE`, so tests
     call the per-terminal functions directly. Source it from `bash`; under `zsh` every
     `BASH_SOURCE` reference warns.
 

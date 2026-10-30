@@ -40,8 +40,9 @@ EOF
             ;;
     esac
     # No tty anywhere in the ancestry, as with a Claude session parented by
-    # launchd rather than started from a terminal tab.
-    if [ "${1:-}" = "notty" ]; then
+    # launchd rather than started from a terminal tab. "noancestor" keeps the
+    # real osascript, as with a hook run by the Codex daemon.
+    if [ "${1:-}" = "notty" ] || [ "${1:-}" = "noancestor" ]; then
         printf '#!/bin/bash\nexit 0\n' > "$dir/ps"
         chmod +x "$dir/ps"
     fi
@@ -218,6 +219,83 @@ if grep -q 'iterm2/cc-status' "$HOME/.claude/settings.json" 2>/dev/null; then
 else
     skip "unroutable session tests" "iTerm's cc-status integration not installed"
 fi
+echo
+
+# ----------------------------------------------------------------- codex ---
+echo "codex"
+codex_payload() {
+    printf '{"hook_event_name":"%s","cwd":"%s","session_id":"%s","turn_id":"t1","stop_hook_active":false%s}' \
+        "$1" "$PWD" "$2" "${3:-}"
+}
+
+stub=$(make_stub)
+codex_payload Stop 0a0a-codex-title ',"last_assistant_message":"All done here"' \
+    | PATH="$stub:$PATH" bash "$EXE" notify
+case "$(arg_of "$stub" -title)" in
+    "cctn: Codex ("*) ok "a turn_id payload is labeled Codex" ;;
+    *) fail "a turn_id payload is labeled Codex" "got [$(arg_of "$stub" -title)]" ;;
+esac
+check "uses Codex's last_assistant_message" "All done here" "$(arg_of "$stub" -message)"
+rm -rf "$stub"
+
+if [ -n "${BASE:-}" ]; then
+    live_id="${BASE#iterm:}"
+    # The Codex daemon keeps the ITERM_SESSION_ID of whichever tab started it.
+    # With no tty above the hook, that id must not be used, even when it names
+    # a live tab.
+    stub=$(make_stub noancestor)
+    codex_payload Stop ffff0000-stale-env | ITERM_SESSION_ID="w0t0p0:$live_id" \
+        CCTN_AGENT=codex PATH="$stub:$PATH" bash "$EXE" notify
+    case "$(arg_of "$stub" -execute)" in
+        *"$live_id"*) fail "ignores the daemon's ITERM_SESSION_ID" "routed to $live_id" ;;
+        *) ok "ignores the daemon's ITERM_SESSION_ID" ;;
+    esac
+    check "posts even when it cannot route" "1" "$(call_count "$stub")"
+    rm -rf "$stub"
+
+    # Tamper check: the same environment for Claude does route to that tab, so
+    # the assertion above is about the Codex rule and not a broken lookup.
+    stub=$(make_stub noancestor)
+    payload Stop "x" sid-claude-env | ITERM_SESSION_ID="w0t0p0:$live_id" \
+        PATH="$stub:$PATH" bash "$EXE" notify
+    case "$(arg_of "$stub" -execute)" in
+        *"$live_id"*) ok "Claude still trusts ITERM_SESSION_ID (tamper check)" ;;
+        *) fail "Claude still trusts ITERM_SESSION_ID (tamper check)" "got [$(arg_of "$stub" -execute)]" ;;
+    esac
+    rm -rf "$stub"
+
+    # A daemon-run hook finds its tab by the thread name Codex puts in the title.
+    tab_name=$(bash "$EXE" resolve "$PWD" | sed -n 2p)
+    codex_home=$(mktemp -d)
+    /usr/bin/sqlite3 "$codex_home/state_5.sqlite" \
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);
+         INSERT INTO threads VALUES ('0123abcd-0000-4000-8000-000000000001', '$(printf '%s' "$tab_name" | sed "s/'/''/g")');"
+    stub=$(make_stub noancestor)
+    codex_payload Stop 0123abcd-0000-4000-8000-000000000001 \
+        | CODEX_HOME="$codex_home" CCTN_AGENT=codex PATH="$stub:$PATH" bash "$EXE" notify
+    case "$(arg_of "$stub" -execute)" in
+        *"focus '$BASE'"*) ok "finds the tab by Codex thread name" ;;
+        *) fail "finds the tab by Codex thread name" "got [$(arg_of "$stub" -execute)] for name [$tab_name]" ;;
+    esac
+    rm -rf "$stub"
+
+    # Tamper check: a thread with no row resolves nowhere.
+    stub=$(make_stub noancestor)
+    codex_payload Stop 0123abcd-0000-4000-8000-000000000002 \
+        | CODEX_HOME="$codex_home" CCTN_AGENT=codex PATH="$stub:$PATH" bash "$EXE" notify
+    case "$(arg_of "$stub" -execute)" in
+        *"$live_id"*) fail "an unknown thread resolves nowhere (tamper check)" "routed to $live_id" ;;
+        *) ok "an unknown thread resolves nowhere (tamper check)" ;;
+    esac
+    rm -rf "$stub" "$codex_home"
+else
+    skip "Codex resolution tests" "this session does not resolve to an iTerm tab"
+fi
+
+stub=$(make_stub)
+codex_payload UserPromptSubmit 0a0a-codex-clear | PATH="$stub:$PATH" bash "$EXE" clear
+check "clear removes the Codex session's group" "$CCTN_GROUP_PREFIX:0a0a-codex-clear" "$(arg_of "$stub" -remove)"
+rm -rf "$stub"
 echo
 
 # ----------------------------------------------------------------- clear ---

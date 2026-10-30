@@ -3,8 +3,12 @@
 
 set -euo pipefail
 
-SETTINGS="$HOME/.claude/settings.json"
-[ -f "$SETTINGS" ] || { echo "nothing to do: $SETTINGS does not exist"; exit 0; }
+CODEX_HOOKS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
+
+# Claude's settings.json and Codex's hooks.json share the same hook shape, so one
+# pass removes this tool's entries from either.
+for SETTINGS in "$HOME/.claude/settings.json" "$CODEX_HOOKS"; do
+[ -f "$SETTINGS" ] || { echo "nothing to do: $SETTINGS does not exist"; continue; }
 
 BACKUP="$SETTINGS.bak-cctn-$(date +%Y%m%d%H%M%S)"
 cp "$SETTINGS" "$BACKUP"
@@ -37,7 +41,8 @@ with open(settings_path, "w") as handle:
     json.dump(settings, handle, indent=2)
     handle.write("\n")
 
-print(f"removed {removed} hook entr{'y' if removed == 1 else 'ies'}")
+print(f"{settings_path}: removed {removed} hook entr{'y' if removed == 1 else 'ies'}")
 PY
 
 echo "backup: $BACKUP"
+done

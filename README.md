@@ -1,6 +1,6 @@
 # claude-code-tab-notify
 
-Claude Code notifications that take you to the right terminal tab, and clear when you get there.
+Claude Code and Codex notifications that take you to the right terminal tab, and clear when you get there.
 
 If you run Claude Code in more than one tab, you already know the problem. A notification arrives, you click it, and nothing happens. Or it raises your terminal and drops you wherever you left off, so you hunt through eleven tabs to find the one that wants you. Meanwhile Notification Center fills with a hundred stale alerts you can no longer match to anything.
 
@@ -110,6 +110,14 @@ Claude Code background sessions run under its daemon rather than in a tab. They 
 Those notifications say `background job: <name>`, read in full from the job's own state file, since the name is the only thing identifying which job woke you.
 
 If iTerm2's Claude Code integration is installed, which its own setup detects by looking for `cc-status` in your hooks, notifications that cannot route anywhere are skipped entirely. iTerm posts a working one for those sessions, so a second one that does nothing on click is noise. Set `CCTN_ALWAYS_NOTIFY=1` to post them anyway.
+
+## Codex
+
+When `~/.codex` exists (or `$CODEX_HOME`), `./install.sh` also adds two hooks to Codex's `hooks.json`: `Stop` runs `notify` and `UserPromptSubmit` runs `clear`. Codex runs a new hook only after you trust it, so open Codex, type `/hooks`, and trust both `claude-code-tab-notify` entries. Notifications from Codex are titled `Codex (<folder>)` and show the end of Codex's reply.
+
+Codex usually runs hooks in one shared background process that serves every tab. That process has no tty, and its `ITERM_SESSION_ID` belongs to whichever tab started it, so neither can say which tab a hook is about. Codex does name each iTerm tab after its conversation (`<name> | <folder> (codex)`), and keeps that name in its state database, so the hook looks the conversation's name up and selects the one iTerm tab with that name. A conversation that has no name yet, or a name two tabs share, falls back to raising iTerm. This lookup is iTerm-only.
+
+`PermissionRequest` is not wired. Codex fires it before its automatic approval reviewer decides, so it would announce approvals that never reach you.
 
 ## Known limits
 
