@@ -9,7 +9,7 @@ asks for input, it posts a macOS notification through `terminal-notifier` carryi
 action that selects the exact terminal tab the session is running in. A companion launchd
 agent clears that notification when you arrive at the tab.
 
-**Main entry point:** `bin/claude-code-tab-notify` (737 lines, one file, no dependencies
+**Main entry point:** `bin/claude-code-tab-notify` (about 900 lines, one file, no dependencies
 beyond `terminal-notifier` and macOS)
 
 **Architecture style:** subcommand dispatch at the bottom of one script; everything above is
@@ -42,6 +42,7 @@ The dispatch block is at the end of `bin/claude-code-tab-notify`, guarded on `BA
 | `focus <handle>` | a notification click | selects the tab for that handle |
 | `resolve` | by hand | prints this session's handle, then its tab name |
 | `doctor` | by hand | checks the pieces this depends on |
+| `prune` | by hand; `watch` runs it on start and every 5 minutes | drops markers whose tab no longer exists |
 
 ### Handles
 
@@ -79,7 +80,23 @@ the moment the caller's directory changes.
 Reading the frontmost app is `lsappinfo` (about 8ms, no AppleScript); asking iTerm which
 session is frontmost is AppleScript (about 146ms). So the expensive question is only asked
 when a marker file says a notification is actually outstanding. `notify` writes one marker
-per posted notification and `clear` removes it.
+per posted notification that has a tab, and `clear` removes it.
+
+**Any marker at all keeps that question running every second**, so a marker that never gets
+cleared costs one AppleScript call a second indefinitely. Two rules keep the directory
+honest:
+
+- A notification with no handle (a background job, a session with no tty) writes no marker.
+  The loop matches markers to the frontmost tab, so one with no tab could never be cleared.
+- `prune_pending` drops a marker once its tab is provably gone: a `tty:`/`terminal:` marker
+  whose tty has no processes or that was written before this boot (macOS reuses tty
+  numbers, so a live tty proves nothing about an older marker), or an `iterm:` marker whose
+  session id iTerm no longer lists. iTerm ids do survive a restart when iTerm restores the
+  tab, so those are checked by id alone.
+  It skips markers under a minute old and keeps any marker it cannot check. Markers outlive
+  their tab whenever a session ends without a reply: a closed tab, a crash, a restart.
+  Before these rules, 120 markers had piled up over a month, 107 of them with no tab, and
+  the agent ran `osascript` about once a second.
 
 ## Conventions
 
@@ -101,6 +118,7 @@ per posted notification and `clear` removes it.
 | `CCTN_PENDING_DIR` | `$HOME/.cache/cctn-pending` | marker files the watch loop reads |
 | `CCTN_WATCH_INTERVAL` | `1` | watch poll seconds |
 | `CCTN_WATCH_QUIET` | unset | silences watch's diagnostics |
+| `CCTN_PRUNE_INTERVAL` | `300` | seconds between the watch loop's stale-marker sweeps |
 | `CCTN_ALWAYS_NOTIFY` | unset | overrides the unroutable-session skip |
 | `CCTN_AGENT` | unset | `codex` marks a Codex hook; a payload with `turn_id` counts too |
 | `CODEX_HOME` | `~/.codex` | where `install.sh` writes Codex's `hooks.json` and where the thread-name lookup reads `state_*.sqlite` |
@@ -157,7 +175,7 @@ worse than sending them nowhere, which is the rule the existing code is built ar
 ### Adding a subcommand
 
 A function named `cmd_<name>`, an arm in the dispatch `case`, and a line in the usage header
-at the top of the file — `cmd_doctor`'s fallback prints lines 2 to 11 of the script itself,
+at the top of the file — `cmd_doctor`'s fallback prints lines 2 to 12 of the script itself (widen that range when the header grows),
 so the header is the help text.
 
 ## Development
@@ -171,7 +189,13 @@ bin/claude-code-tab-notify resolve    # what this session resolves to
 
 The suite stubs `terminal-notifier` on `PATH` and asserts on the arguments it was called
 with (`arg_of`, `call_count` in `test/run.sh`), so it never posts a real notification. It
-covers syntax, resolution, notify, degraded resolution, unroutable sessions, and clear.
+covers syntax, resolution, notify, degraded resolution, unroutable sessions, clear, and
+markers (no marker without a tab; what `prune` drops and keeps).
+
+The suite points `CCTN_PENDING_DIR` at a temporary directory and deletes it on exit. The
+real directory is what the installed watch agent reads, so a test marker left there keeps
+the agent polling iTerm every second. A test that runs the script under `env -i` has to
+pass `CCTN_PENDING_DIR` through explicitly.
 
 ## Gotchas
 

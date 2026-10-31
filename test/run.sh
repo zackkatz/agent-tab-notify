@@ -10,6 +10,10 @@ REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXE="$REPO_DIR/bin/claude-code-tab-notify"
 
 export CCTN_GROUP_PREFIX="cctn-test"
+# The real marker directory is what the installed watch agent reads, so a
+# marker the suite leaves there keeps that agent polling iTerm every second.
+export CCTN_PENDING_DIR; CCTN_PENDING_DIR=$(mktemp -d)
+trap 'rm -rf "$CCTN_PENDING_DIR"' EXIT
 
 PASS=0; FAIL=0; SKIP=0
 
@@ -168,6 +172,7 @@ if env -i PATH="$nojq" "$nojq/bash" -c 'command -v jq' >/dev/null 2>&1; then
 else
     payload Notification "no jq here" sid-nojq | \
         env -i HOME="$HOME" PATH="$nojq" CCTN_GROUP_PREFIX="$CCTN_GROUP_PREFIX" \
+            CCTN_PENDING_DIR="$CCTN_PENDING_DIR" \
             "$nojq/bash" "$EXE" notify
     check "parses hook JSON without jq" "no jq here" "$(arg_of "$stub" -message)"
 fi
@@ -308,6 +313,67 @@ rm -rf "$stub"
 
 bash "$EXE" clear "x:no-such-group-at-all"
 check "clearing an absent group exits cleanly" "0" "$?"
+echo
+
+# --------------------------------------------------------------- markers ---
+echo "markers"
+
+# A session with no tab gets a notification but no marker: the watch loop
+# matches markers to the frontmost tab, so this one could never be cleared.
+stub=$(make_stub notty)
+payload Notification "no tab" sid-nomarker | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a session with no tab still posts" "1" "$(call_count "$stub")"
+if [ -e "$(pending_path "$CCTN_GROUP_PREFIX:sid-nomarker")" ]; then
+    fail "a session with no tab writes no marker" "found $(pending_path "$CCTN_GROUP_PREFIX:sid-nomarker")"
+else ok "a session with no tab writes no marker"; fi
+rm -rf "$stub"
+
+# Markers are aged past prune's one-minute grace so only the tab check decides.
+old_marker() { printf '%s' "$2" > "$CCTN_PENDING_DIR/$1"; touch -t 202001010000 "$CCTN_PENDING_DIR/$1"; }
+has_marker() { [ -e "$CCTN_PENDING_DIR/$1" ] && echo kept || echo dropped; }
+
+old_marker dead-tty "tty:/dev/ttys999"
+old_marker dead-terminal "terminal:/dev/ttys999"
+old_marker no-tab ""
+old_marker unknown-kind "ghostty:some-tab"
+old_marker gone-iterm "iterm:00000000-0000-0000-0000-000000000000"
+printf '' > "$CCTN_PENDING_DIR/fresh-no-tab"
+live_tty=$(ps -axo tty= | grep -m1 '^ttys' | tr -d ' ')
+if [ -n "$live_tty" ]; then
+    # Two minutes old: past the grace period, but written since this boot.
+    printf '%s' "tty:/dev/$live_tty" > "$CCTN_PENDING_DIR/live-tty"
+    touch -t "$(date -v-2M +%Y%m%d%H%M)" "$CCTN_PENDING_DIR/live-tty"
+    # Same live tty, but written before this boot: the number was reused.
+    old_marker reused-tty "tty:/dev/$live_tty"
+fi
+
+# The stubbed osascript answers nothing, so iTerm reads as not running.
+stub=$(make_stub noresolve)
+CCTN_WATCH_QUIET=1 PATH="$stub:$PATH" bash "$EXE" prune
+rm -rf "$stub"
+check "prune drops a marker whose tty is gone" "dropped" "$(has_marker dead-tty)"
+check "prune drops a Terminal.app marker whose tty is gone" "dropped" "$(has_marker dead-terminal)"
+check "prune drops a marker with no tab" "dropped" "$(has_marker no-tab)"
+check "prune drops an iTerm marker when iTerm is not running" "dropped" "$(has_marker gone-iterm)"
+check "prune keeps a marker it cannot check" "kept" "$(has_marker unknown-kind)"
+check "prune keeps a marker under a minute old" "kept" "$(has_marker fresh-no-tab)"
+if [ -n "$live_tty" ]; then
+    check "prune keeps a marker whose tty is live" "kept" "$(has_marker live-tty)"
+    check "prune drops a live tty's marker written before this boot" "dropped" "$(has_marker reused-tty)"
+else
+    skip "prune keeps a marker whose tty is live" "no live tty on this machine"
+fi
+
+if app_running "iTerm2"; then
+    live_iterm=$(osascript -e 'tell application "iTerm2" to get id of first session of current tab of current window' 2>/dev/null)
+    old_marker live-iterm "iterm:$live_iterm"
+    old_marker gone-iterm "iterm:00000000-0000-0000-0000-000000000000"
+    CCTN_WATCH_QUIET=1 bash "$EXE" prune
+    check "prune keeps an iTerm marker whose tab is open" "kept" "$(has_marker live-iterm)"
+    check "prune drops an iTerm marker whose tab is closed" "dropped" "$(has_marker gone-iterm)"
+else
+    skip "prune against a live iTerm" "iTerm2 not running"
+fi
 echo
 
 echo "passed $PASS, failed $FAIL, skipped $SKIP"

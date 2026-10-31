@@ -9,6 +9,7 @@
 #   focus H   select the tab for handle H            (run by a notification click)
 #   resolve   print this session's handle, then its tab name
 #   doctor    check the pieces this depends on
+#   prune     drop markers whose tab no longer exists (watch also does this)
 
 set -uo pipefail
 
@@ -490,7 +491,11 @@ except Exception:
     # Silent and non-fatal on purpose: the marker is an optimization for the
     # watch loop, and a notification must still post on a system where this
     # directory cannot be written.
-    { mkdir -p "$PENDING_DIR" && printf '%s' "$handle" > "$(pending_path "$group_key")"; } 2>/dev/null || true
+    # No handle means no tab, so the watch loop can never match it and the
+    # marker would only keep the loop asking the terminal every second.
+    if [ -n "$handle" ]; then
+        { mkdir -p "$PENDING_DIR" && printf '%s' "$handle" > "$(pending_path "$group_key")"; } 2>/dev/null || true
+    fi
 
     # Raising the wrong terminal would be worse than doing nothing, so an
     # unrecognized one gets no click action at all.
@@ -789,6 +794,65 @@ watch_frontmost_handle() {
     esac
 }
 
+# A marker outlives its tab when a session ends without you replying: the tab
+# is closed, the session crashes, or the Mac restarts. While any marker exists
+# the loop asks the terminal which tab is in front every second, so one dead
+# marker costs an AppleScript call a second indefinitely. A marker is dropped
+# only when its tab is provably gone; if the terminal cannot be asked, it stays.
+PRUNE_INTERVAL="${CCTN_PRUNE_INTERVAL:-300}"
+
+prune_pending() {
+    [ -d "$PENDING_DIR" ] || return 0
+
+    local iterm_ids="" iterm_known=0
+    if app_running "iTerm2"; then
+        iterm_ids=$(watch_ask 'tell application "iTerm2" to get id of every session of every tab of every window')
+        [ -n "$iterm_ids" ] && iterm_known=1
+    else
+        # No iTerm means no iTerm tabs.
+        iterm_known=1
+    fi
+    iterm_ids=",$(printf '%s' "$iterm_ids" | tr -d ' '),"
+
+    # macOS reuses tty numbers, so a live tty only vouches for a marker written
+    # since this boot. iTerm ids are not bounded this way: restored tabs keep them.
+    local boot_epoch
+    boot_epoch=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
+
+    local f handle kind target tty_live written_before_boot
+    for f in "$PENDING_DIR"/*; do
+        [ -f "$f" ] || continue
+        # notify writes the marker before posting, so a fresh one may belong
+        # to a notification still on its way.
+        [ -n "$(find "$f" -mmin +1 2>/dev/null)" ] || continue
+
+        handle=$(cat "$f" 2>/dev/null)
+        kind="${handle%%:*}"
+        target="${handle#*:}"
+        case "$kind" in
+            iterm)
+                [ "$iterm_known" = 1 ] || continue
+                case "$iterm_ids" in *",$target,"*) continue ;; esac
+                ;;
+            tty|terminal)
+                written_before_boot=0
+                [ -n "$boot_epoch" ] && [ "$(stat -f %m "$f" 2>/dev/null || echo 0)" -lt "$boot_epoch" ] \
+                    && written_before_boot=1
+                tty_live=$(ps -t "${target#/dev/}" -o pid= 2>/dev/null)
+                [ -n "$tty_live" ] && [ "$written_before_boot" = 0 ] && continue
+                ;;
+            "")
+                # Written before notify stopped writing handle-less markers.
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        rm -f "$f"
+        watch_say "watch: dropped marker $(basename "$f") (${handle:-no tab}): its tab is gone"
+    done
+}
+
 cmd_watch() {
     # A launchd agent gets PATH=/usr/bin:/bin:/usr/sbin:/sbin, which does not
     # include Homebrew, so say what is missing rather than exiting quietly.
@@ -801,9 +865,17 @@ cmd_watch() {
     done
     echo "watch started, polling every ${WATCH_INTERVAL}s, markers in $PENDING_DIR" >&2
 
+    prune_pending
+    local last_prune=$SECONDS
+
     local last_handle=""
     while :; do
         sleep "$WATCH_INTERVAL"
+
+        if [ $((SECONDS - last_prune)) -ge "$PRUNE_INTERVAL" ]; then
+            prune_pending
+            last_prune=$SECONDS
+        fi
 
         # Nothing outstanding: the cheapest possible tick.
         [ -d "$PENDING_DIR" ] || continue
@@ -843,6 +915,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         focus)   shift; cmd_focus "${1:-}" ;;
         resolve) shift; resolve_handle "${1:-}" "${2:-}" ;;
         doctor)  cmd_doctor ;;
-        *)       sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+        prune)   prune_pending ;;
+        *)       sed -n '2,12p' "$SELF" | sed 's/^# \{0,1\}//' ;;
     esac
 fi
