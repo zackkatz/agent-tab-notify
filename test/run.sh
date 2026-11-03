@@ -10,10 +10,19 @@ REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 EXE="$REPO_DIR/bin/claude-code-tab-notify"
 
 export CCTN_GROUP_PREFIX="cctn-test"
+# The log and the saved tab names live under TMPDIR, and the live hooks use
+# the same ones, so a run of the suite would mix its entries into yours.
+REAL_TMPDIR="${TMPDIR:-/tmp}"
+export TMPDIR; TMPDIR=$(mktemp -d "$REAL_TMPDIR/cctn-test.XXXXXX")
+# Your own settings file must not change what the suite expects.
+export CCTN_CONFIG="$TMPDIR/config"
+# The suite posts from the tab it runs in, which is usually the one in front.
+# The front-tab skip has its own tests with a faked front tab.
+export CCTN_NOTIFY_WHEN_FOCUSED=1
 # The real marker directory is what the installed watch agent reads, so a
 # marker the suite leaves there keeps that agent polling iTerm every second.
 export CCTN_PENDING_DIR; CCTN_PENDING_DIR=$(mktemp -d)
-trap 'rm -rf "$CCTN_PENDING_DIR"' EXIT
+trap 'rm -rf "$CCTN_PENDING_DIR" "$TMPDIR"' EXIT
 
 PASS=0; FAIL=0; SKIP=0
 
@@ -129,6 +138,12 @@ stub=$(make_stub)
 payload Notification "hello" sid-post | PATH="$stub:$PATH" bash "$EXE" notify
 check "posts one notification" "1" "$(call_count "$stub")"
 check "carries the message" "hello" "$(arg_of "$stub" -message)"
+if [ -n "${BASE:-}" ]; then
+    case "$(arg_of "$stub" -title)" in
+        "⌘"[1-9]": "?*|"Tab "[1-9][0-9]*": "?*) ok "title starts with the tab position" ;;
+        *) fail "title starts with the tab position" "got [$(arg_of "$stub" -title)]" ;;
+    esac
+fi
 case "$(arg_of "$stub" -title)" in
     "cctn: "*) fail "title has no prefix by default" "got [$(arg_of "$stub" -title)]" ;;
     ?*) ok "title has no prefix by default" ;;
@@ -151,6 +166,229 @@ printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"sid-fresh2","stop_hoo
     "$PWD" "$stale_transcript" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
 check "falls back to the transcript" "OLD REPLY" "$(arg_of "$stub" -message)"
 rm -rf "$stub" "$stale_transcript"
+
+# The banner gets plain text: no Markdown, no bare lead-in, cut at a word.
+reply_of() {
+    local stub; stub=$(make_stub notty)
+    python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"Stop","cwd":sys.argv[1],"session_id":"sid-reply","stop_hook_active":False,"last_assistant_message":sys.argv[2]}))' "$PWD" "$1" \
+        | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+    arg_of "$stub" -message; rm -rf "$stub"
+}
+check "removes Markdown and a bare lead-in" "Both are in. See the repo and run make." \
+    "$(reply_of $'Done.\n\n**Both are in.** See [the repo](https://x.y/z) and run `make`.')"
+check "separates list lines" "Title. No prefix" "$(reply_of $'- **Title**\n- *No* prefix')"
+check "keeps accented letters whole" "Café résumé — 日本語" "$(reply_of 'Café résumé — 日本語')"
+long_reply="$(reply_of "$(printf 'word%.0s ' {1..60})end")"
+case "$long_reply" in
+    *"word…") ok "cuts a long reply at a word, with an ellipsis" ;;
+    *) fail "cuts a long reply at a word, with an ellipsis" "got [$long_reply]" ;;
+esac
+check "a long reply fits the banner" "1" "$([ "$(printf '%s' "$long_reply" | python3 -c 'import sys;print(len(sys.stdin.read()))')" -le 151 ] && echo 1)"
+
+# Warp cannot be scripted, so its own focus link is the handle, and a click
+# opens it. Its tab is never matched by tty, so no marker is written.
+warp_id=428d4ec809d6424fa3273df7827cd2c8
+stub=$(make_stub noresolve)
+# A live ITERM_SESSION_ID is set on purpose: Warp started from an iTerm2 tab
+# inherits one, and it must not win.
+payload Notification "warp" sid-warp | ITERM_SESSION_ID="w0t0p0:${BASE#iterm:}" TERM_PROGRAM=WarpTerminal \
+    WARP_FOCUS_URL="warp://session/$warp_id" CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+case "$(arg_of "$stub" -execute)" in
+    *"focus 'warp:warp:$warp_id'"*) ok "a Warp session's click opens its focus link" ;;
+    *) fail "a Warp session's click opens its focus link" "got [$(arg_of "$stub" -execute)]" ;;
+esac
+check "a Warp notification is grouped by its session" "cctn-test:warp:$warp_id" "$(arg_of "$stub" -group)"
+check "a Warp session writes no marker" "" "$(ls "$CCTN_PENDING_DIR" | grep "$warp_id")"
+rm -rf "$stub"
+check "ignores a malformed Warp link" "" \
+    "$(TERM_PROGRAM=WarpTerminal WARP_FOCUS_URL='warp://session/x;rm' warp_handle)"
+check "ignores a Warp link outside Warp" "" \
+    "$(TERM_PROGRAM=iTerm.app WARP_FOCUS_URL="warp://session/$warp_id" warp_handle)"
+check "keeps a preview channel's scheme" "warp:warppreview:$warp_id" \
+    "$(TERM_PROGRAM=WarpTerminal WARP_FOCUS_URL="warppreview://session/$warp_id" warp_handle)"
+
+# With no tab name, the session's own name is the title: the /rename one over
+# the generated one, and the last of each.
+named=$(mktemp)
+printf '%s\n' '{"type":"ai-title","aiTitle":"Generated name"}' '{"type":"custom-title","customTitle":"Old name"}' \
+    '{"type":"custom-title","customTitle":"session warp one"}' '{"type":"ai-title","aiTitle":"Later generated"}' > "$named"
+stub=$(make_stub notty)
+printf '{"hook_event_name":"Notification","cwd":"%s","session_id":"sid-named","message":"x","transcript_path":"%s"}' "$PWD" "$named" \
+    | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "titles a tabless session by its /rename name" "session warp one" "$(arg_of "$stub" -title)"
+rm -rf "$stub"
+printf '%s\n' '{"type":"ai-title","aiTitle":"Generated name"}' > "$named"
+stub=$(make_stub notty)
+printf '{"hook_event_name":"Notification","cwd":"%s","session_id":"sid-named2","message":"x","transcript_path":"%s"}' "$PWD" "$named" \
+    | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "falls back to the generated name" "Generated name" "$(arg_of "$stub" -title)"
+rm -rf "$stub" "$named"
+
+# ------------------------------------------------------------- settings ---
+# Each case runs the script in a subshell with its own settings file.
+with_config() {
+    local cfg; cfg=$(mktemp "$TMPDIR/cfg.XXXXXX"); printf '%b' "$1" > "$cfg"; shift
+    CCTN_CONFIG="$cfg" "$@"; local rc=$?; rm -f "$cfg"; return $rc
+}
+cfg_value() { with_config "$1" bash -c 'source "$1"; setting "$2"' _ "$EXE" "$2"; }
+
+check "a setting defaults when the file is missing" "2" "$(CCTN_CONFIG=/nonexistent bash -c 'source "$1"; setting CCTN_CLEAR_DELAY' _ "$EXE")"
+check "reads a plain value" "5" "$(cfg_value 'CCTN_CLEAR_DELAY=5\n' CCTN_CLEAR_DELAY)"
+check "trims spaces around an unquoted value" "30" "$(cfg_value 'CCTN_EXPIRE_AFTER =  30  \n' CCTN_EXPIRE_AFTER)"
+check "keeps spaces inside quotes" "CC: " "$(cfg_value 'CCTN_TITLE_PREFIX="CC: "\n' CCTN_TITLE_PREFIX)"
+check "accepts a short lower-case name" "7" "$(cfg_value 'clear_delay=7\n' CCTN_CLEAR_DELAY)"
+check "ignores comments" "2" "$(cfg_value '# CCTN_CLEAR_DELAY=9\n' CCTN_CLEAR_DELAY)"
+check "reads a Windows line ending" "4" "$(cfg_value 'CCTN_CLEAR_DELAY=4\r\n' CCTN_CLEAR_DELAY)"
+check "reads a last line with no line break" "6" "$(cfg_value 'CCTN_CLEAR_DELAY=6' CCTN_CLEAR_DELAY)"
+check "never runs a value" '$(touch /tmp/cctn-pwned)' "$(cfg_value 'CCTN_SOUND_DONE=$(touch /tmp/cctn-pwned)\n' CCTN_SOUND_DONE)"
+check "an unknown name sets nothing" "" "$(with_config 'CCTN_BOGUS=1\nPATH=/nowhere\n' bash -c 'source "$1"; printf "%s" "${CCTN_BOGUS:-}"; [ "$PATH" = /nowhere ] && printf moved' _ "$EXE")"
+check "the environment wins over the file" "2" "$(CCTN_CLEAR_DELAY=2 cfg_value 'CCTN_CLEAR_DELAY=5\n' CCTN_CLEAR_DELAY)"
+check "a non-number delay falls back to the default" "2" "$(with_config 'CCTN_CLEAR_DELAY=soon\n' bash -c 'source "$1"; setting_seconds CCTN_CLEAR_DELAY' _ "$EXE")"
+
+check "a later line wins over an earlier one" "10" "$(cfg_value 'CCTN_CLEAR_DELAY=5\nCCTN_CLEAR_DELAY=10\n' CCTN_CLEAR_DELAY)"
+check "reads past a byte order mark" "3" "$(cfg_value '\xEF\xBB\xBFCCTN_CLEAR_DELAY=3\n' CCTN_CLEAR_DELAY)"
+check "strips quotes with spaces around them" "a b" "$(cfg_value 'CCTN_TITLE_PREFIX = "a b"  \n' CCTN_TITLE_PREFIX)"
+
+cfgfile="$TMPDIR/written-config"
+CCTN_CONFIG="$cfgfile" bash "$EXE" config set clear_delay 3 >/dev/null
+CCTN_CONFIG="$cfgfile" bash "$EXE" config set sound-done none >/dev/null
+CCTN_CONFIG="$cfgfile" bash "$EXE" config set clear_delay 8 >/dev/null
+check "config set writes and replaces one line" "2" "$(grep -c '^CCTN_' "$cfgfile")"
+check "config set's value reads back" "8" "$(CCTN_CONFIG="$cfgfile" bash -c 'source "$1"; setting CCTN_CLEAR_DELAY' _ "$EXE")"
+CCTN_CONFIG="$cfgfile" bash "$EXE" config unset clear_delay >/dev/null
+check "config unset returns to the default" "2" "$(CCTN_CONFIG="$cfgfile" bash -c 'source "$1"; setting CCTN_CLEAR_DELAY' _ "$EXE")"
+CCTN_CONFIG="$cfgfile" bash "$EXE" config set bogus 1 >/dev/null 2>&1
+check "config set refuses an unknown name" "1" "$?"
+rm -f "$cfgfile"
+
+# A new file explains itself: every setting is there, commented out at its
+# default, and edits change one line in place.
+CCTN_CONFIG="$cfgfile" bash "$EXE" config set clear_delay 3 >/dev/null
+check "a new file lists every setting" "$(printf '%s\n' "$SETTINGS_TABLE" | grep -c .)" "$(grep -c '^# CCTN_\|^CCTN_' "$cfgfile")"
+check "the set value replaces its commented line" "0" "$(grep -c '^# CCTN_CLEAR_DELAY' "$cfgfile")"
+echo "# a note of my own" >> "$cfgfile"
+CCTN_CONFIG="$cfgfile" bash "$EXE" config unset clear_delay >/dev/null
+check "unset turns the line back into its commented default" '# CCTN_CLEAR_DELAY="2"' "$(grep 'CCTN_CLEAR_DELAY' "$cfgfile")"
+check "edits keep other comments" "1" "$(grep -c '^# a note of my own$' "$cfgfile")"
+check "the template itself sets nothing" "0" "$(grep -c '^CCTN_' "$cfgfile")"
+rm -f "$cfgfile"
+
+stub=$(make_stub notty)
+payload Stop "x" sid-off ',"last_assistant_message":"done"' | with_config 'CCTN_NOTIFY_ON_DONE=0\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "notify_on_done=0 posts nothing" "0" "$(call_count "$stub")"
+rm -rf "$stub"
+stub=$(make_stub notty)
+payload Notification "perm" sid-off2 | with_config 'CCTN_NOTIFY_ON_INPUT=no\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "notify_on_input=no posts nothing" "0" "$(call_count "$stub")"
+rm -rf "$stub"
+stub=$(make_stub notty)
+payload Stop "x" sid-snd ',"last_assistant_message":"done"' | with_config 'CCTN_SOUND_DONE=none\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "sound none posts without a sound" "0" "$(grep -c -- '-sound' "$stub/calls.txt")"
+rm -rf "$stub"
+stub=$(make_stub notty)
+payload Notification "perm" sid-snd2 | with_config 'CCTN_SOUND_INPUT=Ping\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a chosen sound is used" "Ping" "$(arg_of "$stub" -sound)"
+rm -rf "$stub"
+
+stub=$(make_stub notty)
+printf '{"hook_event_name":"UserPromptSubmit","cwd":"%s","session_id":"sid-type"}' "$PWD" | with_config 'CCTN_CLEAR_ON_TYPE=0\n' env PATH="$stub:$PATH" bash "$EXE" clear
+check "clear_on_type=0 clears nothing" "0" "$(call_count "$stub")"
+rm -rf "$stub"
+
+# Not notifying for the tab in front: Terminal.app is faked as the front app,
+# with a given tty in its front tab.
+# $2 is the idle time in seconds that a faked ioreg reports (default 0).
+front_stub() {
+    local dir; dir=$(make_stub noresolve)
+    printf '#!/bin/bash\necho "    |   \\"HIDIdleTime\\" = %s"\n' "$(( ${2:-0} * 1000000000 ))" > "$dir/ioreg"; chmod +x "$dir/ioreg"
+    printf '#!/bin/bash\ncase "$1" in front) echo "ASN:0x0-0x1:";; info) echo "\\"CFBundleIdentifier\\"=\\"com.apple.Terminal\\" bundleID=\\"com.apple.Terminal\\"";; esac\n' > "$dir/lsappinfo"
+    printf '#!/bin/bash\ncase "$*" in *"selected tab"*) echo "%s";; esac\nexit 0\n' "$1" > "$dir/osascript"
+    chmod +x "$dir/lsappinfo" "$dir/osascript"
+    echo "$dir"
+}
+my_tty=$(session_tty)
+if [ -n "$my_tty" ]; then
+    stub=$(front_stub "$my_tty")
+    payload Stop "x" sid-front ',"last_assistant_message":"done"' | env -u CCTN_NOTIFY_WHEN_FOCUSED PATH="$stub:$PATH" bash "$EXE" notify
+    check "posts nothing for the tab in front" "0" "$(call_count "$stub")"
+    rm -rf "$stub"
+    stub=$(front_stub "/dev/ttys999")
+    payload Stop "x" sid-front2 ',"last_assistant_message":"done"' | env -u CCTN_NOTIFY_WHEN_FOCUSED PATH="$stub:$PATH" bash "$EXE" notify
+    check "posts for a tab that is not in front (tamper check)" "1" "$(call_count "$stub")"
+    rm -rf "$stub"
+    stub=$(front_stub "$my_tty")
+    payload Stop "x" sid-front3 ',"last_assistant_message":"done"' | CCTN_NOTIFY_WHEN_FOCUSED=1 PATH="$stub:$PATH" bash "$EXE" notify
+    check "notify_when_focused=1 posts for the tab in front" "1" "$(call_count "$stub")"
+    rm -rf "$stub"
+    stub=$(front_stub "$my_tty" 120)
+    payload Stop "x" sid-away ',"last_assistant_message":"done"' | env -u CCTN_NOTIFY_WHEN_FOCUSED PATH="$stub:$PATH" bash "$EXE" notify
+    check "posts for the tab in front when you have been away" "1" "$(call_count "$stub")"
+    rm -rf "$stub"
+    stub=$(front_stub "$my_tty" 120)
+    payload Stop "x" sid-away2 ',"last_assistant_message":"done"' | env -u CCTN_NOTIFY_WHEN_FOCUSED CCTN_AWAY_AFTER=0 PATH="$stub:$PATH" bash "$EXE" notify
+    check "away_after=0 never posts for the tab in front" "0" "$(call_count "$stub")"
+    rm -rf "$stub"
+else
+    skip "front-tab tests" "no tty for this session"
+fi
+check "a tty handle matches Terminal's front tab with that tty" "yes" "$(handles_match tty:/dev/ttys1 $'terminal:/dev/ttys1\n/dev/ttys1' && echo yes)"
+check "a tty handle matches iTerm2's front tab with that tty" "yes" "$(handles_match tty:/dev/ttys5 $'iterm:A\n/dev/ttys5' && echo yes)"
+check "different tabs do not match" "no" "$(handles_match iterm:A $'iterm:B\n/dev/ttys2' || echo no)"
+check "an empty front tab matches nothing" "no" "$(handles_match iterm:A '' || echo no)"
+
+stub=$(make_stub notty)
+payload Stop "x" sid-bc ',"last_assistant_message":"a real reply"' | with_config 'CCTN_BANNER_CHARS=abc\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a bad banner_chars still shows the reply" "a real reply" "$(arg_of "$stub" -message)"
+rm -rf "$stub"
+stub=$(make_stub notty)
+payload Stop "x" sid-dash ',"last_assistant_message":"-1 test failed"' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a reply starting with a dash stays a value" $'\xE2\x80\x8B-1 test failed' "$(arg_of "$stub" -message)"
+rm -rf "$stub"
+err_out=$(watch_ask 'this is not applescript' 2>&1 >/dev/null)
+case "$err_out" in "watch: osascript failed"*) ok "the watcher reports an AppleScript error" ;;
+    *) fail "the watcher reports an AppleScript error" "got [$err_out]" ;; esac
+
+# The "waiting for your input" reminder must not replace the reply.
+idle_payload() {
+    printf '{"hook_event_name":"Notification","cwd":"%s","session_id":"%s","message":"%s"%s}' "$PWD" "$1" "$2" "${3:-}"
+}
+stub=$(make_stub notty)
+idle_payload sid-idle "Claude is waiting for your input" ',"notification_type":"idle_prompt"' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "skips the idle reminder" "0" "$(call_count "$stub")"
+idle_payload sid-idle2 "Claude is waiting for your input" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "skips the idle reminder from an older Claude Code" "0" "$(call_count "$stub")"
+idle_payload sid-perm "Claude needs your permission to use Bash" ',"notification_type":"permission_prompt"' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "still posts a permission request (tamper check)" "1" "$(call_count "$stub")"
+rm -rf "$stub"
+stub=$(make_stub notty)
+idle_payload sid-idle3 "Claude is waiting for your input" ',"notification_type":"idle_prompt"' | CCTN_NOTIFY_ON_IDLE=1 CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "notify_on_idle=1 posts the reminder" "1" "$(call_count "$stub")"
+rm -rf "$stub"
+
+# Expiry: the notification removes itself, and an older timer never removes
+# the newer notification that replaced its own.
+stub=$(make_stub notty)
+payload Stop "x" sid-exp ',"last_assistant_message":"one"' | with_config 'CCTN_EXPIRE_AFTER=1\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+sleep 2.5
+check "expire_after removes the notification" "-remove" "$(sed -n 2p "$stub/calls.txt" | cut -f1)"
+rm -rf "$stub"
+stub=$(make_stub notty)
+payload Stop "x" sid-exp2 ',"last_assistant_message":"one"' | with_config 'CCTN_EXPIRE_AFTER=1\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+payload Stop "x" sid-exp2 ',"last_assistant_message":"two"' | with_config 'CCTN_EXPIRE_AFTER=3\n' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+sleep 2
+check "an older timer leaves the newer notification" "0" "$(grep -c -- '-remove' "$stub/calls.txt")"
+sleep 2
+check "the newer notification's own timer removes it" "1" "$(grep -c -- '-remove' "$stub/calls.txt")"
+rm -rf "$stub"
+# Turning expiry off must also stop the timer of the notification it replaces.
+stub=$(make_stub notty)
+payload Stop "x" sid-exp3 ',"last_assistant_message":"one"' | with_config 'CCTN_EXPIRE_AFTER=1
+' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+payload Stop "x" sid-exp3 ',"last_assistant_message":"two"' | with_config 'CCTN_EXPIRE_AFTER=0
+' env CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+sleep 2
+check "an old timer leaves a notification posted with expiry off" "0" "$(grep -c -- '-remove' "$stub/calls.txt")"
+rm -rf "$stub"
 
 # Two sessions with no tab and no tty must still not overwrite each other; the
 # Claude session id is the only thing left to tell them apart.
@@ -189,7 +427,7 @@ if env -i PATH="$nojq" "$nojq/bash" -c 'command -v jq' >/dev/null 2>&1; then
 else
     payload Notification "no jq here" sid-nojq | \
         env -i HOME="$HOME" PATH="$nojq" CCTN_GROUP_PREFIX="$CCTN_GROUP_PREFIX" \
-            CCTN_PENDING_DIR="$CCTN_PENDING_DIR" \
+            CCTN_PENDING_DIR="$CCTN_PENDING_DIR" CCTN_CONFIG="$CCTN_CONFIG" \
             "$nojq/bash" "$EXE" notify
     check "parses hook JSON without jq" "no jq here" "$(arg_of "$stub" -message)"
 fi
@@ -203,8 +441,7 @@ tty=$(session_tty)
 if [ -n "$tty" ]; then
     cache="${TMPDIR:-/tmp}/cctn-tabnames/$(echo "$tty" | tr '/' '_')"
     mkdir -p "$(dirname "$cache")"
-    saved=""; [ -f "$cache" ] && saved=$(cat "$cache")
-    printf 'CACHED TAB NAME' > "$cache"
+    printf '◑ CACHED TAB NAME (claude)' > "$cache"
 
     stub=$(make_stub noresolve)
     payload Notification "degraded" sid-degraded | PATH="$stub:$PATH" bash "$EXE" notify
@@ -215,11 +452,9 @@ if [ -n "$tty" ]; then
         "nohup "*"focus 'tty:$tty'"*"&") ok "click target falls back to the tty, detached" ;;
         *) fail "click target falls back to the tty, detached" "got [$got_exec]" ;;
     esac
-    check "reuses the last known tab name" "CACHED TAB NAME" "$(arg_of "$stub" -title)"
+    check "reuses the last known tab name, without the status glyph or (claude)" "CACHED TAB NAME" "$(arg_of "$stub" -title)"
     check "the tab name is the only heading (no subtitle)" "" "$(arg_of "$stub" -subtitle)"
     rm -rf "$stub"
-
-    if [ -n "$saved" ]; then printf '%s' "$saved" > "$cache"; else rm -f "$cache"; fi
 else
     skip "degraded resolution tests" "no tty for this session"
 fi
@@ -289,19 +524,27 @@ if [ -n "${BASE:-}" ]; then
     rm -rf "$stub"
 
     # A daemon-run hook finds its tab by the thread name Codex puts in the title.
-    tab_name=$(bash "$EXE" resolve "$PWD" | sed -n 2p)
+    # This tab's name is Claude Code's, whose status glyph animates, so it can
+    # change between reading it and matching it. Retry with a fresh read; the
+    # tamper check below still proves a wrong name matches nothing.
     codex_home=$(mktemp -d)
-    /usr/bin/sqlite3 "$codex_home/state_5.sqlite" \
-        "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);
-         INSERT INTO threads VALUES ('0123abcd-0000-4000-8000-000000000001', '$(printf '%s' "$tab_name" | sed "s/'/''/g")');"
-    stub=$(make_stub noancestor)
-    codex_payload Stop 0123abcd-0000-4000-8000-000000000001 \
-        | CODEX_HOME="$codex_home" CCTN_AGENT=codex PATH="$stub:$PATH" bash "$EXE" notify
-    case "$(arg_of "$stub" -execute)" in
-        *"focus '$BASE'"*) ok "finds the tab by Codex thread name" ;;
-        *) fail "finds the tab by Codex thread name" "got [$(arg_of "$stub" -execute)] for name [$tab_name]" ;;
-    esac
-    rm -rf "$stub"
+    found_codex_tab=""
+    for attempt in 1 2 3; do
+        tab_name=$(bash "$EXE" resolve "$PWD" | sed -n 2p)
+        rm -f "$codex_home/state_5.sqlite"
+        /usr/bin/sqlite3 "$codex_home/state_5.sqlite" \
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);
+             INSERT INTO threads VALUES ('0123abcd-0000-4000-8000-000000000001', '$(printf '%s' "$tab_name" | sed "s/'/''/g")');"
+        stub=$(make_stub noancestor)
+        codex_payload Stop 0123abcd-0000-4000-8000-000000000001 \
+            | CODEX_HOME="$codex_home" CCTN_AGENT=codex PATH="$stub:$PATH" bash "$EXE" notify
+        got_exec=$(arg_of "$stub" -execute)
+        rm -rf "$stub"
+        case "$got_exec" in *"focus '$BASE'"*) found_codex_tab=1; break ;; esac
+    done
+    if [ -n "$found_codex_tab" ]; then ok "finds the tab by Codex thread name"
+    else fail "finds the tab by Codex thread name" "got [$got_exec] for name [$tab_name]"
+    fi
 
     # Tamper check: a thread with no row resolves nowhere.
     stub=$(make_stub noancestor)

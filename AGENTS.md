@@ -54,6 +54,16 @@ and takes the first that answers:
 - `terminal:<tty>` — Terminal.app exposes a tty per tab
 - `ghostty:<tab id>` — matched by working directory, and only when unambiguous
 - `tty:<tty>` — unresolved; the click works out which terminal owns it later
+- `warp:<scheme>:<32 hex>` — from `$WARP_FOCUS_URL` (`warp_handle()`); checked in `cmd_notify()`
+  before `resolve`, because Warp started from an iTerm2 tab inherits that tab's
+  `ITERM_SESSION_ID`. A click opens `<scheme>://session/<id>`. No marker is written, since
+  Warp cannot name its frontmost tab. Undocumented by Warp; verified on 0.2026.10.14.
+
+`resolve` prints the handle, then the tab name, then the tab's position in its window, then
+(iTerm2 and the Codex lookup only) the window's tab count. `tab_shortcut()` turns the last two
+into the `⌘N: ` title prefix: iTerm2 maps ⌘9 to the last tab, other terminals to tab nine.
+With no tab name, the title is the session's `/rename` name, then its generated name
+(`session_name()` reads `custom-title` / `ai-title` entries from the transcript).
 
 The `tty:` fallback exists because asking a terminal anything requires AppleScript, which
 stalls under load when several sessions post at once. Reading the tty costs no AppleScript,
@@ -109,6 +119,39 @@ honest:
 - **Failures are silent by design in the hook paths** (a broken notifier must never block
   Claude) and **loud in `watch` and `doctor`**, which exist to be diagnosed.
 
+## Settings
+
+User settings live in `~/.config/claude-code-tab-notify/config` (`$CCTN_CONFIG` overrides the
+path), as `CCTN_NAME="value"` lines. `SETTINGS_TABLE` near the top of the script is the single
+list of names, defaults and descriptions; `config` prints from it and `config set` refuses
+any name not in it. `load_config()` parses the file as data (never `source`d), skips names
+already in the environment so an env var wins, and records which names came from the file
+in `CONFIG_FILE_KEYS` so a reload can unset them first. Read a value with `setting NAME`,
+`setting_seconds NAME` for numbers, and `is_on` for booleans. The defaults lookup is plain
+bash on purpose: a hook with a bare PATH (no awk) once read every default as empty, which
+`is_on` treats as off, and nothing posted. The watch loop stats the file each tick and
+reloads it when it changes. `expire_after` timers are detached `expire` subcommands; each
+post writes a token to `$TMPDIR/cctn-expire/<group>`, and a timer removes the notification
+only if its token is still the latest.
+
+`notify_when_focused` (default off): `cmd_notify` asks `tab_in_front()` for the front tab's
+handle and tty (one `lsappinfo`, plus one AppleScript call only when iTerm2 or Terminal is in
+front) and skips the post when `handles_match()` says it is this session's tab. Ghostty and
+Warp cannot name their front tab, so they always post. The suite exports
+`CCTN_NOTIFY_WHEN_FOCUSED=1` because it runs from the tab in front.
+`user_is_away()` reads `HIDIdleTime` from `ioreg` (nanoseconds, about 20ms); when idle passes
+`away_after` the front-tab skip is bypassed. The suite's `front_stub` fakes `ioreg` too, or
+the result would depend on whether someone is at the keyboard.
+
+The `Notification` event's `notification_type` (Claude Code 2.1.317: `permission_prompt`,
+`idle_prompt`, `auth_success`, `elicitation_dialog`, `agent_needs_input`, `agent_completed`,
+and others) drives `notify_on_idle`: `idle_prompt` is skipped by default, as is a payload
+with no type whose message is "Claude is waiting for your input" (older versions).
+
+Watch loop states: `fresh` (nothing was pending last tick, so the tab you are on when a
+notification first appears counts as already visited, not arrived at), `last_handle`,
+`arrived_at` and `cleared` (one clear per visit, after `clear_delay` seconds on the tab).
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -120,6 +163,9 @@ honest:
 | `CCTN_WATCH_QUIET` | unset | silences watch's diagnostics |
 | `CCTN_PRUNE_INTERVAL` | `300` | seconds between the watch loop's stale-marker sweeps |
 | `CCTN_ALWAYS_NOTIFY` | unset | overrides the unroutable-session skip |
+| `CCTN_BANNER_CHARS` | `150` | most characters of the reply `clean_reply` keeps, cut at a word |
+| `CCTN_CONFIG` | `~/.config/claude-code-tab-notify/config` | settings file path; the suite points it at a temp file |
+| other `CCTN_*` settings | see `SETTINGS_TABLE` | any setting can also come from the environment, which wins over the file |
 | `CCTN_AGENT` | unset | `codex` marks a Codex hook; a payload with `turn_id` counts too |
 | `CODEX_HOME` | `~/.codex` | where `install.sh` writes Codex's `hooks.json` and where the thread-name lookup reads `state_*.sqlite` |
 
@@ -169,7 +215,7 @@ Four functions, and all four are needed or the terminal half-works:
 4. A `TERM_PROGRAM` arm in `cmd_notify()` so an unresolved session still raises the app.
 
 **Only add a terminal that exposes a per-tab identifier.** Ghostty is matched by working
-directory and only when unique; Warp is app-level only. Sending someone to the wrong tab is
+directory and only when unique; Warp by its own `WARP_FOCUS_URL` link. Sending someone to the wrong tab is
 worse than sending them nowhere, which is the rule the existing code is built around.
 
 ### Adding a subcommand

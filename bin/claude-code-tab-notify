@@ -7,9 +7,10 @@
 #   clear     drop this session's notification       (UserPromptSubmit hook)
 #   watch     clear a tab's notification when you switch to it (background)
 #   focus H   select the tab for handle H            (run by a notification click)
-#   resolve   print this session's handle, then its tab name
+#   resolve   print this session's handle, tab name, tab position, and (iTerm2) tab count
 #   doctor    check the pieces this depends on
 #   prune     drop markers whose tab no longer exists (watch also does this)
+#   config    show settings; config set NAME VALUE; config unset NAME
 
 set -uo pipefail
 
@@ -18,6 +19,118 @@ set -uo pipefail
 # a path that stops resolving the moment the caller's directory changes.
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# ------------------------------------------------------------- settings ----
+
+# Settings live in a file because the hooks and the watch agent start with
+# different environments: a variable exported in your shell never reaches the
+# launchd agent. An environment variable of the same name still wins, so a
+# one-off override needs no edit.
+CONFIG_FILE="${CCTN_CONFIG:-$HOME/.config/claude-code-tab-notify/config}"
+
+# name|default|description. The order here is the order `config` prints.
+SETTINGS_TABLE='CCTN_NOTIFY_ON_DONE|1|Notify when Claude finishes a reply
+CCTN_NOTIFY_ON_INPUT|1|Notify when Claude needs permission or input
+CCTN_NOTIFY_ON_IDLE|0|Notify for Claude Code'"'"'s "waiting for your input" reminder, which replaces the reply
+CCTN_NOTIFY_WHEN_FOCUSED|0|Notify even when you are looking at that session'"'"'s tab
+CCTN_AWAY_AFTER|60|Seconds without keyboard or mouse use after which the tab in front gets notified too (0 = never)
+CCTN_SOUND_DONE|Blow|Sound when Claude finishes (a name from /System/Library/Sounds, or none)
+CCTN_SOUND_INPUT|Glass|Sound when Claude needs you (a name from /System/Library/Sounds, or none)
+CCTN_CLEAR_ON_TYPE|1|Clear a tab'"'"'s notification when you type in that tab
+CCTN_CLEAR_ON_SWITCH|1|Clear a notification when you switch to its tab (needs the watcher)
+CCTN_CLEAR_DELAY|2|Seconds to stay on a tab before switching to it clears its notification
+CCTN_EXPIRE_AFTER|0|Seconds before a notification removes itself (0 keeps it until cleared)
+CCTN_BANNER_CHARS|150|Most characters of Claude'"'"'s reply to show
+CCTN_TITLE_PREFIX||Text before every title, to tell these from other notifications
+CCTN_ALWAYS_NOTIFY|0|Notify even for sessions that cannot be matched to a tab'
+
+CONFIG_FILE_KEYS=""
+CONFIG_MTIME=""
+
+# Plain bash, no awk or grep: a hook can run with a bare PATH, and a default
+# that fails to load would read as "off" and silence every notification.
+setting_known() {
+    local line
+    while IFS= read -r line; do
+        [ "${line%%|*}" = "$1" ] && return 0
+    done <<< "$SETTINGS_TABLE"
+    return 1
+}
+
+# "clear_delay", "CLEAR_DELAY" and "CCTN_CLEAR_DELAY" all name one setting.
+setting_name() {
+    local name
+    name=$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')
+    case "$name" in CCTN_*) ;; *) name="CCTN_$name" ;; esac
+    printf '%s' "$name"
+}
+
+# Reads NAME=value lines. Never sourced: the file is data, so nothing in it
+# runs. Values may be quoted to keep spaces at either end.
+load_config() {
+    local key
+    for key in $CONFIG_FILE_KEYS; do unset "$key"; done
+    CONFIG_FILE_KEYS=""
+    CONFIG_MTIME=$(/usr/bin/stat -f %m "$CONFIG_FILE" 2>/dev/null)
+    [ -f "$CONFIG_FILE" ] || return 0
+    # Names the environment set before this file was read. Those win; for the
+    # rest, a later line in the file wins over an earlier one.
+    local env_keys=" " default rest
+    while IFS='|' read -r key default rest; do
+        [ -n "${!key+x}" ] && env_keys="$env_keys$key "
+    done <<< "$SETTINGS_TABLE"
+    local line value first=1
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        # A byte order mark, as some editors save one, would glue onto the
+        # first name and hide it.
+        [ "$first" = 1 ] && line="${line#$'\xEF\xBB\xBF'}"
+        first=0
+        case "$line" in ''|[[:space:]]*'#'*|'#'*) continue ;; esac
+        case "$line" in *=*) ;; *) continue ;; esac
+        key=$(setting_name "$(printf '%s' "${line%%=*}" | tr -d '[:space:]')")
+        value="${line#*=}"
+        setting_known "$key" || continue
+        [[ "$env_keys" == *" $key "* ]] && continue
+        value=$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+        esac
+        printf -v "$key" '%s' "$value"
+        export "$key"
+        [[ " $CONFIG_FILE_KEYS " == *" $key "* ]] || CONFIG_FILE_KEYS="$CONFIG_FILE_KEYS $key"
+    done < "$CONFIG_FILE"
+}
+
+setting_default() {
+    local key default rest
+    while IFS='|' read -r key default rest; do
+        [ "$key" = "$1" ] && { printf '%s' "$default"; return 0; }
+    done <<< "$SETTINGS_TABLE"
+}
+
+# The value in force: environment or file, else the default.
+setting() {
+    local key="$1"
+    if [ -n "${!key+x}" ]; then printf '%s' "${!key}"; else setting_default "$key"; fi
+}
+
+is_on() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
+# A whole number of seconds, or the default when the value is anything else.
+setting_seconds() {
+    local value
+    value=$(setting "$1")
+    case "$value" in ''|*[!0-9]*) setting_default "$1" ;; *) printf '%s' "$value" ;; esac
+}
+
+load_config
 
 # Overridable so the test suite can post without touching real notifications.
 GROUP_PREFIX="${CCTN_GROUP_PREFIX:-claude-code-tab-notify}"
@@ -146,7 +259,32 @@ detect_agent() {
 forget_daemon_env() {
     [ "$AGENT" = "codex" ] || return 0
     [ -n "$(find_ancestor_tty)" ] && return 0
-    unset ITERM_SESSION_ID TMUX TMUX_PANE
+    unset ITERM_SESSION_ID TMUX TMUX_PANE WARP_FOCUS_URL
+}
+
+# Warp's stable build is dev.warp.Warp-Stable; older builds used dev.warp.Warp.
+# Prints the first one installed, or nothing. Spotlight answers in about 60ms;
+# AppleScript's "path to application id" took 7.5s on a cold first call.
+warp_bundle() {
+    local id app
+    for id in dev.warp.Warp-Stable dev.warp.Warp; do
+        [ -n "$(mdfind "kMDItemCFBundleIdentifier == '$id'" 2>/dev/null | head -1)" ] && { echo "$id"; return 0; }
+    done
+    # Spotlight can be off or still indexing.
+    for app in /Applications/Warp.app "$HOME/Applications/Warp.app"; do
+        id=$(defaults read "$app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null)
+        case "$id" in dev.warp.Warp-Stable|dev.warp.Warp) echo "$id"; return 0 ;; esac
+    done
+}
+
+# Warp has no scripting dictionary, but since 2026 it gives every shell a link
+# that brings that exact session forward: <scheme>://session/<32 hex>, where the
+# scheme is warp, warppreview or another channel's. Prints "warp:<scheme>:<id>",
+# or nothing outside Warp or when the value is not that shape.
+warp_handle() {
+    [ "${TERM_PROGRAM:-}" = "WarpTerminal" ] || return 0
+    [[ "${WARP_FOCUS_URL:-}" =~ ^(warp[a-z]*)://session/([0-9a-f]{32})$ ]] || return 0
+    echo "warp:${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
 }
 
 agent_label() {
@@ -169,12 +307,14 @@ on run argv
   set ttyMatch to ""
   tell application "iTerm2"
     repeat with w in windows
+      set tabIndex to 0
       repeat with t in tabs of w
+        set tabIndex to tabIndex + 1
         repeat with s in sessions of t
           if wantID is not "" and (id of s) is wantID then ¬
-            return "iterm:" & (id of s) & linefeed & (name of s)
+            return "iterm:" & (id of s) & linefeed & (name of s) & linefeed & tabIndex & linefeed & (count of tabs of w)
           if wantTTY is not "" and (tty of s) is wantTTY then ¬
-            set ttyMatch to "iterm:" & (id of s) & linefeed & (name of s)
+            set ttyMatch to "iterm:" & (id of s) & linefeed & (name of s) & linefeed & tabIndex & linefeed & (count of tabs of w)
         end repeat
       end repeat
     end repeat
@@ -192,7 +332,9 @@ on run argv
   set wantTTY to item 1 of argv
   tell application "Terminal"
     repeat with w in windows
+      set tabIndex to 0
       repeat with t in tabs of w
+        set tabIndex to tabIndex + 1
         if (tty of t) is wantTTY then
           -- Terminal tabs have no `name`; asking for one fails with -1700.
           set tabName to ""
@@ -200,7 +342,7 @@ on run argv
             set tabName to custom title of t
           end try
           if tabName is "" then set tabName to (processes of t) as text
-          return "terminal:" & wantTTY & linefeed & tabName
+          return "terminal:" & wantTTY & linefeed & tabName & linefeed & tabIndex
         end if
       end repeat
     end repeat
@@ -221,12 +363,16 @@ on run argv
   set wantDir to item 1 of argv
   set matchIDs to {}
   set matchNames to {}
+  set matchIndexes to {}
   tell application "Ghostty"
     repeat with w in windows
+      set tabIndex to 0
       repeat with t in tabs of w
+        set tabIndex to tabIndex + 1
         repeat with trm in terminals of t
           if (working directory of trm) is wantDir then
             set end of matchIDs to (id of t)
+            set end of matchIndexes to tabIndex
             set end of matchNames to (name of t)
           end if
         end repeat
@@ -234,7 +380,7 @@ on run argv
     end repeat
   end tell
   if (count of matchIDs) is 1 then ¬
-    return "ghostty:" & (item 1 of matchIDs) & linefeed & (item 1 of matchNames)
+    return "ghostty:" & (item 1 of matchIDs) & linefeed & (item 1 of matchNames) & linefeed & (item 1 of matchIndexes)
   return ""
 end run
 APPLESCRIPT
@@ -263,13 +409,19 @@ on run argv
   set wantName to item 1 of argv
   set matchIDs to {}
   set matchNames to {}
+  set matchIndexes to {}
+  set matchCounts to {}
   tell application "iTerm2"
     repeat with w in windows
+      set tabIndex to 0
       repeat with t in tabs of w
+        set tabIndex to tabIndex + 1
         repeat with s in sessions of t
           set sName to name of s
           if sName is wantName or sName starts with (wantName & " |") then
             set end of matchIDs to (id of s)
+            set end of matchIndexes to tabIndex
+            set end of matchCounts to (count of tabs of w)
             set end of matchNames to sName
           end if
         end repeat
@@ -277,7 +429,7 @@ on run argv
     end repeat
   end tell
   if (count of matchIDs) is 1 then ¬
-    return "iterm:" & (item 1 of matchIDs) & linefeed & (item 1 of matchNames)
+    return "iterm:" & (item 1 of matchIDs) & linefeed & (item 1 of matchNames) & linefeed & (item 1 of matchIndexes) & linefeed & (item 1 of matchCounts)
   return ""
 end run
 APPLESCRIPT
@@ -371,6 +523,81 @@ end run
 APPLESCRIPT
 }
 
+# The tab's keyboard shortcut as a title prefix, or its position when it has
+# none. iTerm2 maps ⌘1 to ⌘8 to tabs one to eight and ⌘9 to the last tab, so a
+# ninth tab that is not the last has no shortcut. Other terminals map ⌘1 to ⌘9
+# to tabs one to nine.
+tab_shortcut() {
+    local app="$1" index="$2" count="$3"
+    case "$index" in [1-9]|[1-9][0-9]*) ;; *) return 0 ;; esac
+    if [ "$app" = "iterm" ]; then
+        if [ "$index" -le 8 ]; then printf '⌘%s: ' "$index"
+        elif [ "$index" = "$count" ]; then printf '⌘9: '
+        else printf 'Tab %s: ' "$index"
+        fi
+    elif [ "$index" -le 9 ]; then printf '⌘%s: ' "$index"
+    else printf 'Tab %s: ' "$index"
+    fi
+}
+
+# The session's name from Claude Code's transcript: the one you gave it with
+# /rename, else the one Claude generated. This is the fallback title where no
+# tab name can be read, as in Warp. About 45ms on a 220MB transcript.
+session_name() {
+    [ -f "$1" ] || return 0
+    grep -a -E '"type":"(custom|ai)-title"' "$1" 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+custom = ai = ""
+for line in sys.stdin:
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    if entry.get("type") == "custom-title":
+        custom = entry.get("customTitle") or custom
+    elif entry.get("type") == "ai-title":
+        ai = entry.get("aiTitle") or ai
+print(" ".join((custom or ai).split()))
+' 2>/dev/null
+}
+
+# A reply as banner text: Markdown removed, a bare lead-in line such as
+# "Done." skipped, and cut at a word near what a banner shows in three lines.
+# Python because sed and cut count bytes, which splits accented letters.
+BANNER_CHARS=$(setting_seconds CCTN_BANNER_CHARS)
+[ "$BANNER_CHARS" -gt 0 ] 2>/dev/null || BANNER_CHARS=$(setting_default CCTN_BANNER_CHARS)
+clean_reply() {
+    /usr/bin/python3 -c '
+import re, sys
+limit = int(sys.argv[1])
+text = sys.stdin.read()
+text = re.sub(r"```.*?```", " ", text, flags=re.S)
+lines = []
+for line in text.splitlines():
+    line = re.sub(r"^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)", "", line)
+    line = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", line)
+    line = re.sub(r"`([^`]*)`", r"\1", line)
+    line = re.sub(r"(\*\*|__)(.+?)\1", r"\2", line)
+    line = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\1", line)
+    line = re.sub(r"~~(.+?)~~", r"\1", line)
+    line = re.sub(r"^\s*\|?\s*:?-{3,}.*$", "", line)
+    line = " ".join(line.replace("|", " ").split())
+    if line:
+        lines.append(line)
+if len(lines) > 1 and len(lines[0]) <= 20 and lines[0][-1:] in ".:!":
+    lines = lines[1:]
+text = " ".join(l if i == len(lines) - 1 or l[-1] in ".!?:;,…" else l + "."
+               for i, l in enumerate(lines))
+if len(text) > limit:
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    text = cut.rstrip(" ,;:.-") + "…"
+print(text)
+' "$BANNER_CHARS" 2>/dev/null
+}
+
 # ---------------------------------------------------------------- notify ----
 
 cmd_notify() {
@@ -389,6 +616,24 @@ cmd_notify() {
         exit 0
     fi
 
+    case "$hook_event" in
+        Stop) is_on "$(setting CCTN_NOTIFY_ON_DONE)" || exit 0 ;;
+        Notification|PermissionRequest) is_on "$(setting CCTN_NOTIFY_ON_INPUT)" || exit 0 ;;
+    esac
+
+    # About a minute after a reply, Claude Code sends a "waiting for your input"
+    # reminder. Posting it would replace the notification that shows the reply
+    # (one per tab) with a message that says less. Older versions send no
+    # notification_type, so the message itself is checked too.
+    if [ "$hook_event" = "Notification" ] && ! is_on "$(setting CCTN_NOTIFY_ON_IDLE)"; then
+        local notification_type
+        notification_type=$(json_get '.notification_type')
+        if [ "$notification_type" = "idle_prompt" ] || \
+           { [ -z "$notification_type" ] && [ "$(json_get '.message')" = "Claude is waiting for your input" ]; }; then
+            exit 0
+        fi
+    fi
+
     transcript_path=$(json_get '.transcript_path')
     notification_msg=$(json_get '.message')
     payload_cwd=$(json_get '.cwd')
@@ -400,20 +645,20 @@ cmd_notify() {
     # so read the transcript only when the payload has nothing.
     local last_assistant_msg=""
     if [ "$hook_event" = "Stop" ]; then
-        last_assistant_msg=$(json_get '.last_assistant_message' | tr '\n' ' ' | sed 's/ *$//' | cut -c1-100)
+        last_assistant_msg=$(json_get '.last_assistant_message' | clean_reply)
     fi
     # Tool calls and thinking blocks also live in content[], so select on type
     # rather than trusting the first element.
     if [ -z "$last_assistant_msg" ] && [ -f "$transcript_path" ] && [ "$hook_event" = "Stop" ] && command -v jq >/dev/null 2>&1; then
         last_assistant_msg=$(tail -40 "$transcript_path" 2>/dev/null | \
-            jq -r 'select(.message.role == "assistant")
+            jq -c 'select(.message.role == "assistant")
                    | [.message.content[]? | select(.type == "text") | .text]
-                   | join(" ")' 2>/dev/null | \
-            grep -v '^$' | tail -1 | tr '\n' ' ' | sed 's/ *$//' | cut -c1-100)
+                   | join("\n") | select(. != "")' 2>/dev/null | \
+            tail -1 | jq -r '.' 2>/dev/null | clean_reply)
     fi
     # Codex hands over the reply itself rather than a transcript to dig through.
     if [ "$AGENT" = "codex" ]; then
-        last_assistant_msg=$(json_get '.last_assistant_message' | tr '\n' ' ' | sed 's/ *$//' | cut -c1-100)
+        last_assistant_msg=$(json_get '.last_assistant_message' | clean_reply)
         local tool_name
         tool_name=$(json_get '.tool_name')
         [ -n "$tool_name" ] && notification_msg="Codex wants to use $tool_name"
@@ -424,12 +669,12 @@ cmd_notify() {
         Notification|PermissionRequest)
             title="Input Required"
             msg=${notification_msg:-"$(agent_label) needs your input"}
-            sound="Glass"
+            sound=$(setting CCTN_SOUND_INPUT)
             ;;
         Stop)
             title="Task Complete"
             msg=${last_assistant_msg:-"Task completed"}
-            sound="Blow"
+            sound=$(setting CCTN_SOUND_DONE)
             ;;
         *)
             title="$(agent_label)"
@@ -438,7 +683,7 @@ cmd_notify() {
             ;;
     esac
 
-    local info="" handle="" tab_title="" claude_session_id
+    local info="" handle="" tab_title="" tab_index="" tab_count="" claude_session_id
     claude_session_id=$(json_get '.session_id')
 
     # Background sessions run under Claude's daemon rather than in a tab, so
@@ -462,14 +707,22 @@ except Exception:
         fi
         [ -n "$job_name" ] || job_name="${CLAUDE_CODE_SESSION_NAME:-}"
         tab_title="background job${job_name:+: $job_name}"
+    elif [ -n "$(warp_handle)" ]; then
+        # Checked before iTerm2: Warp started from an iTerm2 tab inherits its
+        # ITERM_SESSION_ID, which would send the click to that iTerm2 tab.
+        handle=$(warp_handle)
     elif [ "$AGENT" = "codex" ]; then
         info=$(bounded 8 bash "$SELF" resolve "$payload_cwd" "$claude_session_id")
         handle=$(echo "$info" | head -1)
         tab_title=$(echo "$info" | sed -n 2p)
+        tab_index=$(echo "$info" | sed -n 3p)
+        tab_count=$(echo "$info" | sed -n 4p)
     else
         info=$(bounded 8 bash "$SELF" resolve "$payload_cwd")
         handle=$(echo "$info" | head -1)
         tab_title=$(echo "$info" | sed -n 2p)
+        tab_index=$(echo "$info" | sed -n 3p)
+        tab_count=$(echo "$info" | sed -n 4p)
     fi
 
     # Resolution can come back empty when a terminal is slow to answer, which
@@ -499,7 +752,9 @@ except Exception:
     # directory cannot be written.
     # No handle means no tab, so the watch loop can never match it and the
     # marker would only keep the loop asking the terminal every second.
-    if [ -n "$handle" ]; then
+    # Warp cannot name its frontmost tab either, so a Warp marker would only
+    # keep the loop polling.
+    if [ -n "$handle" ] && [ "${handle%%:*}" != "warp" ]; then
         { mkdir -p "$PENDING_DIR" && printf '%s' "$handle" > "$(pending_path "$group_key")"; } 2>/dev/null || true
     fi
 
@@ -510,7 +765,7 @@ except Exception:
         iTerm.app)      fallback_app="com.googlecode.iterm2" ;;
         Apple_Terminal) fallback_app="com.apple.Terminal" ;;
         vscode)         fallback_app="com.microsoft.VSCode" ;;
-        WarpTerminal)   fallback_app="dev.warp.Warp" ;;
+        WarpTerminal)   fallback_app=$(warp_bundle) ;;
         ghostty)        fallback_app="com.mitchellh.ghostty" ;;
     esac
 
@@ -537,9 +792,25 @@ except Exception:
     # clicked. Only skip when that integration is installed, since on any other
     # machine a notification that merely raises the terminal still beats silence.
     # That integration covers Claude Code only, so a Codex session always posts.
+    # You are already looking at the tab, so a notification would only repeat
+    # what is on screen. iTerm2 and Terminal can name their front tab; Ghostty
+    # and Warp cannot, so their sessions always notify.
+    # Unless you have stepped away: then nobody is looking, and the sound is
+    # what calls you back.
+    if ! is_on "$(setting CCTN_NOTIFY_WHEN_FOCUSED)" && [ -n "$handle" ] && ! user_is_away; then
+        local front_handle
+        front_handle=$(tab_in_front)
+        if handles_match "$handle" "$front_handle"; then
+            printf '%s event=%s session=%s SKIPPED (tab is in front)\n' \
+                "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" \
+                >> "${TMPDIR:-/tmp}/cctn.log" 2>/dev/null
+            exit 0
+        fi
+    fi
+
     local iterm_integration=""
     [ "$AGENT" = "claude" ] && grep -q 'iterm2/cc-status' "$HOME/.claude/settings.json" 2>/dev/null && iterm_integration=1
-    if [ -z "$handle" ] && [ -n "$iterm_integration" ] && [ -z "${CCTN_ALWAYS_NOTIFY:-}" ]; then
+    if [ -z "$handle" ] && [ -n "$iterm_integration" ] && ! is_on "$(setting CCTN_ALWAYS_NOTIFY)"; then
         printf '%s event=%s session=%s SKIPPED (unroutable; iTerm integration active)\n' \
             "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" \
             >> "${TMPDIR:-/tmp}/cctn.log" 2>/dev/null
@@ -557,18 +828,40 @@ except Exception:
     # event, so the notification still says what happened.
     local heading
     if [ -n "$tab_title" ]; then
-        heading="$tab_title"
+        # Claude Code starts its tab title with a status glyph (a spinning half
+        # moon while working, ✳ when idle). It is already stale by the time the
+        # banner shows, and it pushes the name right.
+        # Every Claude Code tab ends in "(claude)", so it says nothing here.
+        # Codex tabs keep their own label.
+        heading=$(printf '%s' "$tab_title" | LC_ALL=en_US.UTF-8 sed -E \
+            -e 's/^[^[:alnum:][:space:]]+[[:space:]]+//' -e 's/[[:space:]]+\(claude\)$//')
+        # ⌘1 to ⌘9 select a tab by position. Only a fresh lookup has a
+        # position: a cached name may have moved.
+        heading="$(tab_shortcut "${handle%%:*}" "$tab_index" "$tab_count")$heading"
     else
-        heading="$(agent_label) ($session_dir): $title"
+        heading=$(session_name "$transcript_path")
+        [ -n "$heading" ] || heading="$(agent_label) ($session_dir): $title"
     fi
+
+    # terminal-notifier reads its arguments as defaults, so a value starting
+    # with "-" can be taken for an option. A zero-width space in front keeps
+    # it a value and does not show.
+    local zwsp=$'\xE2\x80\x8B'
+    case "$msg" in -*) msg="$zwsp$msg" ;; esac
+    heading="${TITLE_PREFIX}${heading}"
+    case "$heading" in -*) heading="$zwsp$heading" ;; esac
 
     local args
     args=(
-        -title "${TITLE_PREFIX}${heading}"
+        -title "$heading"
         -message "$msg"
-        -sound "$sound"
         -group "$group_key"
     )
+    # "none" or an empty value means a silent notification.
+    case "$(printf '%s' "$sound" | tr '[:upper:]' '[:lower:]')" in
+        ''|none|off|0) ;;
+        *) args+=(-sound "$sound") ;;
+    esac
 
     if [ -n "$handle" ]; then
         # terminal-notifier is relaunched to handle the click and exits within
@@ -588,19 +881,59 @@ except Exception:
         printf '%s event=%s session=%s terminal-notifier exited %s\n' \
             "$(date '+%H:%M:%S')" "$hook_event" "${claude_session_id:0:8}" "$status" >> "$log" 2>/dev/null
     fi
+
+    schedule_expiry "$group_key"
     return 0
+}
+
+# --------------------------------------------------------------- expire ----
+
+# Timers live under TMPDIR: the hook that starts one and the timer itself share
+# an environment, and nothing else reads them.
+EXPIRE_DIR="${TMPDIR:-/tmp}/cctn-expire"
+
+expiry_path() {
+    printf '%s/%s' "$EXPIRE_DIR" "$(printf '%s' "$1" | tr '/:' '__')"
+}
+
+# Removes the notification after CCTN_EXPIRE_AFTER seconds. Each post writes a
+# fresh token, and a timer acts only when its token is still the latest, so an
+# old timer never removes the newer notification that replaced its own.
+schedule_expiry() {
+    local seconds token
+    seconds=$(setting_seconds CCTN_EXPIRE_AFTER)
+    # Without a timer for this post, an older timer must not remove it.
+    rm -f "$(expiry_path "$1")" 2>/dev/null
+    [ "$seconds" -gt 0 ] 2>/dev/null || return 0
+    token="$$.$RANDOM.$(date +%s)"
+    { mkdir -p "$EXPIRE_DIR" && printf '%s' "$token" > "$(expiry_path "$1")"; } 2>/dev/null || return 0
+    # Detached with every stream closed, so the hook returns at once.
+    nohup "$SELF" expire "$1" "$token" "$seconds" </dev/null >/dev/null 2>&1 &
+}
+
+cmd_expire() {
+    local group="$1" token="$2" seconds="$3"
+    [ -n "$group" ] && [ -n "$token" ] || return 0
+    sleep "$seconds"
+    local current
+    current=$(cat "$(expiry_path "$group")" 2>/dev/null)
+    [ "$current" = "$token" ] || return 0
+    terminal-notifier -remove "$group" >/dev/null 2>&1
+    rm -f "$(expiry_path "$group")" "$(pending_path "$group")" 2>/dev/null
 }
 
 # ----------------------------------------------------------------- clear ----
 
 cmd_clear() {
-    have_notifier || exit 0
+    # return, not exit: the watch loop calls this, and exiting would end it.
+    have_notifier || return 0
 
     local keys=()
     if [ -n "${1:-}" ]; then
         keys+=("$GROUP_PREFIX:${1#*:}")
     else
         read_stdin
+        is_on "$(setting CCTN_CLEAR_ON_TYPE)" || return 0
         detect_agent
         forget_daemon_env
         local claude_session_id payload_cwd handle raw_tty codex_thread=""
@@ -608,7 +941,8 @@ cmd_clear() {
         [ -n "$claude_session_id" ] && keys+=("$GROUP_PREFIX:$claude_session_id")
         [ "$AGENT" = "codex" ] && codex_thread="$claude_session_id"
         payload_cwd=$(json_get '.cwd')
-        handle=$(bounded 8 bash "$SELF" resolve "$payload_cwd" "$codex_thread" | head -1)
+        handle=$(warp_handle)
+        [ -n "$handle" ] || handle=$(bounded 8 bash "$SELF" resolve "$payload_cwd" "$codex_thread" | head -1)
         [ -n "$handle" ] && keys+=("$GROUP_PREFIX:${handle#*:}")
         # A notification posted while resolution was slow is keyed by tty, which
         # is a different key than the same tab's resolved id.
@@ -621,7 +955,7 @@ cmd_clear() {
     local key
     for key in ${keys+"${keys[@]}"}; do
         terminal-notifier -remove "$key" >/dev/null 2>&1
-        rm -f "$(pending_path "$key")" 2>/dev/null
+        rm -f "$(pending_path "$key")" "$(expiry_path "$key")" 2>/dev/null
     done
 }
 
@@ -637,6 +971,15 @@ cmd_focus() {
         iterm)    result=$(focus_iterm "$target");        bundle="com.googlecode.iterm2" ;;
         terminal) result=$(focus_terminal_app "$target"); bundle="com.apple.Terminal" ;;
         ghostty)  result=$(focus_ghostty "$target");      bundle="com.mitchellh.ghostty" ;;
+        warp)
+            # Opening the link selects the session's window and tab. Raising the
+            # app as well covers a link that selects without activating.
+            local scheme="${target%%:*}" id="${target#*:}"
+            open "$scheme://session/$id" >/dev/null 2>&1 && result="ok"
+            if [ "$scheme" = "warp" ]; then
+                open -b dev.warp.Warp-Stable >/dev/null 2>&1 || open -b dev.warp.Warp >/dev/null 2>&1
+            fi
+            ;;
         tty)
             # Deferred lookup: work out which terminal owns this tty now.
             # ITERM_SESSION_ID must be cleared: it describes whoever is running
@@ -747,6 +1090,14 @@ cmd_doctor() {
         echo "    could not read com.apple.ncprefs.plist"
     fi
 
+    local changed
+    changed=$(printf '%s' "$CONFIG_FILE_KEYS" | wc -w | tr -d ' ')
+    echo "  settings: $CONFIG_FILE ($changed changed from the defaults; run: config)"
+    if [ "$(setting_seconds CCTN_CLEAR_DELAY)" -gt 0 ] || ! is_on "$(setting CCTN_CLEAR_ON_SWITCH)"; then
+        launchctl list 2>/dev/null | grep -q 'claude-code-tab-notify.watch' \
+            || echo "         note: the switch-tab settings only matter while the watcher runs, and it is not loaded"
+    fi
+
     return $ok
 }
 
@@ -786,7 +1137,8 @@ watch_say() {
 watch_ask() {
     local out err rc
     err=$(mktemp)
-    out=$(bounded 5 osascript -e "$1" 2>"$err"); rc=$?
+    # Not bounded(): it discards stderr, and the error is what this reports.
+    out=$(perl -e 'alarm shift; exec @ARGV' 5 osascript -e "$1" 2>"$err"); rc=$?
     if [ -n "$(cat "$err" 2>/dev/null)" ]; then
         watch_say "watch: osascript failed ($(head -1 "$err"))"
     fi
@@ -794,17 +1146,51 @@ watch_ask() {
     [ $rc -eq 0 ] && printf '%s' "$out"
 }
 
+# True when the keyboard and mouse have been idle for CCTN_AWAY_AFTER seconds.
+# HIDIdleTime is in nanoseconds. Reading it takes about 20ms.
+user_is_away() {
+    local away idle_ns
+    away=$(setting_seconds CCTN_AWAY_AFTER)
+    [ "$away" -gt 0 ] 2>/dev/null || return 1
+    idle_ns=$(ioreg -c IOHIDSystem 2>/dev/null | sed -n 's/.*"HIDIdleTime" = \([0-9]*\).*/\1/p' | head -1)
+    [ -n "$idle_ns" ] || return 1
+    [ $((idle_ns / 1000000000)) -ge "$away" ]
+}
+
+# The handle of the tab in front, then its tty, when the front app is a
+# terminal that can say which tab that is. Costs one lsappinfo call, plus one
+# AppleScript round trip only when iTerm2 or Terminal is in front.
+tab_in_front() {
+    local bundle
+    bundle=$(watch_frontmost_bundle)
+    CCTN_WATCH_QUIET=1 watch_frontmost_handle "$bundle"
+}
+
+# $1 is a session's handle; $2 is tab_in_front's output (handle, then tty).
+# They name one tab when the handles are equal, or when $1 is an unresolved
+# tty handle carrying the front tab's tty.
+handles_match() {
+    local front_handle front_tty
+    front_handle=$(printf '%s\n' "$2" | sed -n 1p)
+    front_tty=$(printf '%s\n' "$2" | sed -n 2p)
+    [ -n "$1" ] && [ -n "$front_handle" ] || return 1
+    [ "$1" = "$front_handle" ] && return 0
+    [ -n "$front_tty" ] && [ "$1" = "tty:$front_tty" ]
+}
+
 watch_frontmost_handle() {
     case "$1" in
         com.googlecode.iterm2)
-            local id
-            id=$(watch_ask 'tell application "iTerm2" to tell current window to tell current tab to tell current session to get id')
-            [ -n "$id" ] && printf 'iterm:%s' "$id"
+            # The tty comes in the same round trip: a notification posted while
+            # resolution was slow is keyed by tty, not by session id.
+            local both
+            both=$(watch_ask 'tell application "iTerm2" to tell current window to tell current tab to tell current session to return (id as text) & "|" & (tty as text)')
+            [ -n "${both%%|*}" ] && printf 'iterm:%s\n%s\n' "${both%%|*}" "${both#*|}"
             ;;
         com.apple.Terminal)
             local tty
             tty=$(watch_ask 'tell application "Terminal" to get tty of selected tab of front window')
-            [ -n "$tty" ] && printf 'terminal:%s' "$tty"
+            [ -n "$tty" ] && printf 'terminal:%s\n%s\n' "$tty" "$tty"
             ;;
     esac
 }
@@ -851,7 +1237,7 @@ prune_pending() {
                 ;;
             tty|terminal)
                 written_before_boot=0
-                [ -n "$boot_epoch" ] && [ "$(stat -f %m "$f" 2>/dev/null || echo 0)" -lt "$boot_epoch" ] \
+                [ -n "$boot_epoch" ] && [ "$(/usr/bin/stat -f %m "$f" 2>/dev/null || echo 0)" -lt "$boot_epoch" ] \
                     && written_before_boot=1
                 tty_live=$(ps -t "${target#/dev/}" -o pid= 2>/dev/null)
                 [ -n "$tty_live" ] && [ "$written_before_boot" = 0 ] && continue
@@ -883,7 +1269,11 @@ cmd_watch() {
     prune_pending
     local last_prune=$SECONDS
 
-    local last_handle=""
+    # last_handle is the tab you were last seen on, arrived_at when you got
+    # there, and cleared whether this visit has already cleared it. fresh means
+    # no notification was waiting on the previous tick, so nobody was watching
+    # which tab you were on.
+    local last_handle="" arrived_at=0 cleared=1 fresh=1
     while :; do
         sleep "$WATCH_INTERVAL"
 
@@ -892,30 +1282,165 @@ cmd_watch() {
             last_prune=$SECONDS
         fi
 
+        # Settings can change while the agent runs; one stat per tick notices.
+        if [ "$(/usr/bin/stat -f %m "$CONFIG_FILE" 2>/dev/null)" != "$CONFIG_MTIME" ]; then
+            load_config
+            watch_say "watch: settings reloaded from $CONFIG_FILE"
+        fi
+        is_on "$(setting CCTN_CLEAR_ON_SWITCH)" || { fresh=1; continue; }
+
         # Nothing outstanding: the cheapest possible tick.
-        [ -d "$PENDING_DIR" ] || continue
-        local pending
-        pending=$(ls -1 "$PENDING_DIR" 2>/dev/null | head -1)
-        [ -n "$pending" ] || { last_handle=""; continue; }
+        local pending=""
+        [ -d "$PENDING_DIR" ] && pending=$(ls -1 "$PENDING_DIR" 2>/dev/null | head -1)
+        [ -n "$pending" ] || { fresh=1; continue; }
 
         local bundle handle
         bundle=$(watch_frontmost_bundle)
         case "$bundle" in
             com.googlecode.iterm2|com.apple.Terminal) ;;
-            *) last_handle=""; continue ;;
+            # Being in another app counts as having left every tab.
+            *) last_handle=""; fresh=0; continue ;;
         esac
 
-        handle=$(watch_frontmost_handle "$bundle")
+        local front front_tty
+        front=$(watch_frontmost_handle "$bundle")
+        handle=$(printf '%s\n' "$front" | sed -n 1p)
+        front_tty=$(printf '%s\n' "$front" | sed -n 2p)
         [ -n "$handle" ] || continue
 
-        # Only act when the frontmost tab changed. Sitting in one tab must not
-        # re-clear it every second, or a notification arriving for the tab you
-        # are already looking at would be wiped before you saw it.
-        [ "$handle" = "$last_handle" ] && continue
-        last_handle="$handle"
+        # The first notification found you already on this tab, so you have
+        # not arrived anywhere. A notification for the tab you are looking at
+        # must wait until you leave and come back, not vanish within a second.
+        if [ "$fresh" = 1 ]; then
+            last_handle="$handle"; cleared=1; fresh=0
+            continue
+        fi
+
+        if [ "$handle" != "$last_handle" ]; then
+            last_handle="$handle"; arrived_at=$SECONDS; cleared=0
+        fi
+        # Sitting in one tab must not re-clear it every second.
+        [ "$cleared" = 1 ] && continue
+        [ $((SECONDS - arrived_at)) -ge "$(setting_seconds CCTN_CLEAR_DELAY)" ] || continue
 
         cmd_clear "$handle"
+        [ -n "$front_tty" ] && cmd_clear "tty:$front_tty"
+        cleared=1
     done
+}
+
+# ---------------------------------------------------------------- config ----
+
+cmd_config() {
+    local action="${1:-show}"
+    case "$action" in
+        show|"") config_show ;;
+        set)
+            [ $# -ge 3 ] || { echo "usage: config set NAME VALUE" >&2; return 1; }
+            config_write "$(setting_name "$2")" "${*:3}" ;;
+        unset)
+            [ $# -ge 2 ] || { echo "usage: config unset NAME" >&2; return 1; }
+            config_write "$(setting_name "$2")" ;;
+        path) echo "$CONFIG_FILE" ;;
+        *) echo "usage: config [show | set NAME VALUE | unset NAME | path]" >&2; return 1 ;;
+    esac
+}
+
+config_show() {
+    if [ -f "$CONFIG_FILE" ]; then echo "Settings file: $CONFIG_FILE"
+    else echo "Settings file: $CONFIG_FILE (not created yet; every setting is at its default)"
+    fi
+    echo
+    local key default description value source short
+    while IFS='|' read -r key default description; do
+        value=$(setting "$key")
+        if [[ " $CONFIG_FILE_KEYS " == *" $key "* ]]; then source="file"
+        elif [ -n "${!key+x}" ]; then source="environment"
+        else source="default"
+        fi
+        short=$(printf '%s' "${key#CCTN_}" | tr '[:upper:]' '[:lower:]')
+        printf '  %-16s = %-8s (%s)\n      %s\n' "$short" "\"$value\"" "$source" "$description"
+    done <<< "$SETTINGS_TABLE"
+    echo
+    echo "Change one with: $(basename "$SELF") config set clear_delay 5"
+    echo "Whether notifications stay on screen is set in System Settings, Notifications,"
+    echo "terminal-notifier: Alerts stay until dismissed, Banners fade after a few seconds."
+}
+
+# A new settings file lists every setting, commented out at its default, with
+# its description above it, so the file explains itself when edited by hand.
+config_template() {
+    printf '# claude-code-tab-notify settings\n'
+    printf '#\n'
+    printf '# Remove the "# " in front of a setting to change it. A line that starts\n'
+    printf '# with "#" is ignored. On/off settings take 1 (on) or 0 (off).\n'
+    printf '# Or use the command: claude-code-tab-notify config set NAME VALUE\n'
+    local key default description
+    while IFS='|' read -r key default description; do
+        printf '\n# %s\n# %s="%s"\n' "$description" "$key" "$default"
+    done <<< "$SETTINGS_TABLE"
+}
+
+# Changes one setting's line in place, so the rest of the file, comments
+# included, stays as it is. Setting a value replaces the active line, or else
+# the commented-out template line, or else adds a line at the end. Unsetting
+# turns the line back into its commented-out default.
+config_write() {
+    local key="$1" value="${2-}" removing=0
+    [ $# -lt 2 ] && removing=1
+    setting_known "$key" || { echo "unknown setting: $key (run: $(basename "$SELF") config)" >&2; return 1; }
+    case "$value" in *\"*|*$'\n'*) echo "a value cannot contain a double quote or a line break" >&2; return 1 ;; esac
+    mkdir -p "$(dirname "$CONFIG_FILE")" || return 1
+    [ -f "$CONFIG_FILE" ] || config_template > "$CONFIG_FILE"
+
+    local new_line
+    if [ "$removing" = 1 ]; then new_line="# $key=\"$(setting_default "$key")\""
+    else new_line="$key=\"$value\""
+    fi
+
+    # Prefer the active line; fall back to the commented-out one.
+    local line name has_active=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in '#'*) continue ;; esac
+        name=$(setting_name "$(printf '%s' "${line%%=*}" | tr -d '[:space:]')")
+        [ "$name" = "$key" ] && { has_active=1; break; }
+    done < "$CONFIG_FILE"
+
+    local tmp="$CONFIG_FILE.tmp.$$" placed=0 stripped
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            stripped="${line#\#}"; stripped="${stripped# }"
+            name=$(setting_name "$(printf '%s' "${stripped%%=*}" | tr -d '[:space:]')")
+            case "$line" in
+                ''|*'='*) ;;
+                *) printf '%s\n' "$line"; continue ;;
+            esac
+            if [ "$name" != "$key" ]; then printf '%s\n' "$line"; continue; fi
+            case "$line" in
+                '#'*)
+                    # The commented-out line: take it over only when no active
+                    # line exists. Unsetting leaves it alone.
+                    if [ "$has_active" = 0 ] && [ "$removing" = 0 ] && [ "$placed" = 0 ]; then
+                        printf '%s\n' "$new_line"; placed=1
+                    else
+                        printf '%s\n' "$line"
+                    fi ;;
+                *)
+                    # An active line: the first becomes the new line, any later
+                    # duplicates go, since they would win over it.
+                    if [ "$placed" = 0 ]; then printf '%s\n' "$new_line"; placed=1; fi ;;
+            esac
+        done < "$CONFIG_FILE"
+        [ "$placed" = 1 ] || [ "$removing" = 1 ] || printf '%s\n' "$new_line"
+    } > "$tmp" && cat "$tmp" > "$CONFIG_FILE"   # cat, not mv: keeps a symlinked file a symlink
+    rm -f "$tmp"
+
+    if [ "$removing" = 1 ]; then echo "$key is back to its default, \"$(setting_default "$key")\""
+    else echo "$key=\"$value\" saved in $CONFIG_FILE"
+    fi
+    if [ -n "${!key+x}" ] && [[ " $CONFIG_FILE_KEYS " != *" $key "* ]]; then
+        echo "note: $key is also set in your environment, which wins over the file"
+    fi
 }
 
 # ------------------------------------------------------------------ main ----
@@ -931,6 +1456,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         resolve) shift; resolve_handle "${1:-}" "${2:-}" ;;
         doctor)  cmd_doctor ;;
         prune)   prune_pending ;;
-        *)       sed -n '2,12p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+        expire)  shift; cmd_expire "${1:-}" "${2:-}" "${3:-0}" ;;
+        config)  shift; cmd_config "$@" ;;
+        *)       sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//' ;;
     esac
 fi
