@@ -7,7 +7,7 @@
 # `terminal-notifier -list` hanging).
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-EXE="$REPO_DIR/bin/claude-code-tab-notify"
+EXE="$REPO_DIR/bin/agent-tab-notify"
 
 export CCTN_GROUP_PREFIX="cctn-test"
 # The log and the saved tab names live under TMPDIR, and the live hooks use
@@ -76,7 +76,7 @@ payload() {
 
 source "$EXE"
 
-echo "claude-code-tab-notify tests"
+echo "agent-tab-notify tests"
 echo
 
 # ---------------------------------------------------------------- syntax ---
@@ -364,6 +364,47 @@ stub=$(make_stub notty)
 idle_payload sid-idle3 "Claude is waiting for your input" ',"notification_type":"idle_prompt"' | CCTN_NOTIFY_ON_IDLE=1 CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
 check "notify_on_idle=1 posts the reminder" "1" "$(call_count "$stub")"
 rm -rf "$stub"
+
+# Permission prompts say what is being asked, and the generic Notification
+# that follows for the same prompt does not replace it.
+perm_payload() {
+    python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"PermissionRequest","cwd":sys.argv[1],"session_id":sys.argv[2],"tool_name":sys.argv[3],"tool_input":json.loads(sys.argv[4])}))' "$PWD" "$1" "$2" "$3"
+}
+stub=$(make_stub notty)
+perm_payload sid-perm-a Bash '{"command":"git push origin main"}' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a permission request names the command" "Wants to run: git push origin main" "$(arg_of "$stub" -message)"
+idle_payload sid-perm-a "Claude needs your permission" ',"notification_type":"permission_prompt"' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "the generic permission notice after it is dropped" "1" "$(call_count "$stub")"
+idle_payload sid-perm-b "Claude needs your permission" ',"notification_type":"permission_prompt"' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a generic permission notice with no detailed one still posts (tamper check)" "2" "$(call_count "$stub")"
+rm -rf "$stub"
+stub=$(make_stub notty)
+perm_payload sid-perm-c Edit "{\"file_path\":\"$PWD/src/app.ts\"}" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "an edit request shows the path from the project folder" "Wants to edit: src/app.ts" "$(arg_of "$stub" -message)"
+perm_payload sid-perm-d mcp__plugin_linear-gravitykit_linear-gravitykit__save_issue '{"title":"Fix the map header"}' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "an MCP request names the server and tool" "Wants to use linear-gravitykit save_issue: Fix the map header" "$(arg_of "$stub" -message 2)"
+rm -rf "$stub"
+
+# The old name still works, and its clicks point at the new file.
+stub=$(make_stub notty)
+payload Notification "old name" sid-oldname | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$REPO_DIR/bin/claude-code-tab-notify" notify
+check "the old name still posts" "old name" "$(arg_of "$stub" -message)"
+rm -rf "$stub"
+check "the old name resolves to the new file" "$REPO_DIR/bin/agent-tab-notify" "$(bash -c 'source "$1"; printf %s "$SELF"' _ "$REPO_DIR/bin/claude-code-tab-notify")"
+
+# The installer points hooks from before the rename at this checkout.
+fake_home=$(mktemp -d "$TMPDIR/home.XXXXXX")
+mkdir -p "$fake_home/.claude"
+printf '%s\n' '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"/old/place/bin/claude-code-tab-notify\" notify"},{"type":"command","command":"/other/tool"}]}]}}' > "$fake_home/.claude/settings.json"
+HOME="$fake_home" CODEX_HOME="$fake_home/no-codex" bash "$REPO_DIR/install.sh" >/dev/null 2>&1
+installed=$(python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; print(";".join(sorted(e+"="+x["command"] for e,g in h.items() for gg in g for x in gg["hooks"])))' "$fake_home/.claude/settings.json")
+case "$installed" in *"Stop=\"$REPO_DIR/bin/agent-tab-notify\" notify"*) ok "install moves an old hook to the new name" ;; *) fail "install moves an old hook to the new name" "got [$installed]" ;; esac
+case "$installed" in *"PermissionRequest=\"$REPO_DIR/bin/agent-tab-notify\" notify"*) ok "install adds the PermissionRequest hook" ;; *) fail "install adds the PermissionRequest hook" "got [$installed]" ;; esac
+case "$installed" in *"Stop=/other/tool"*) ok "install leaves other hooks alone" ;; *) fail "install leaves other hooks alone" "got [$installed]" ;; esac
+check "install leaves no old-name hook" "0" "$(grep -c 'bin/claude-code-tab-notify' "$fake_home/.claude/settings.json")"
+HOME="$fake_home" CODEX_HOME="$fake_home/no-codex" bash "$REPO_DIR/uninstall.sh" >/dev/null 2>&1
+check "uninstall removes every hook it added" "0" "$(grep -c 'tab-notify' "$fake_home/.claude/settings.json")"
+rm -rf "$fake_home"
 
 # Expiry: the notification removes itself, and an older timer never removes
 # the newer notification that replaced its own.

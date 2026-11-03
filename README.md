@@ -1,14 +1,19 @@
-# claude-code-tab-notify
+# agent-tab-notify
 
-macOS notifications for Claude Code (and Codex) that take you to the right terminal tab when you click them.
+Notifications for Claude Code and Codex that take you to the right tab in iTerm2, Terminal, Ghostty or Warp, and clear themselves once you've seen them.
 
-When you run Claude Code in several tabs, it's hard to tell which one needs you. This tool posts a notification every time Claude finishes or asks for something. The notification says which tab it came from, clicking it switches to that exact tab, and it disappears once you've dealt with it.
+When you run AI agents in several tabs, it's hard to tell which one needs you. Most notification tools for Claude Code tell you that something finished. This one also tells you where, and keeps itself tidy:
+
+- **Click to go straight there.** Clicking switches to the exact tab, even in another window, in iTerm2, Terminal, Ghostty and Warp, and inside tmux.
+- **It clears itself.** A notification goes away when you switch to its tab or type there. Each tab keeps only its latest one, so old ones don't pile up.
+- **It says what's going on.** The title is the tab's name and shortcut, and the message is the start of the reply, or the exact command Claude wants permission to run.
+- **It stays quiet when you can already see the answer,** but still calls you if you've stepped away.
 
 <img src="docs/notification.png" width="460" alt="A macOS notification titled &quot;⌘2: Tab Notify&quot; that reads: Click this notification to jump to the tab Claude is working in. It clears itself once you get there.">
 
 
 - **Title:** the tab's name. `⌘2:` means you can also press ⌘2 in that terminal window to get there.
-- **Message:** the start of Claude's reply, or what Claude is asking for.
+- **Message:** the start of Claude's reply, or what Claude wants permission to do, such as `Wants to run: git push origin main`.
 - **Click:** switches to that tab, even if it's in another window.
 
 ## What you need
@@ -29,8 +34,8 @@ brew install terminal-notifier
 **2. Download this tool.** Put it somewhere permanent, because your hooks will run it from that folder:
 
 ```bash
-git clone https://github.com/zackkatz/claude-code-tab-notify.git
-cd claude-code-tab-notify
+git clone https://github.com/zackkatz/agent-tab-notify.git
+cd agent-tab-notify
 ```
 
 **3. Run the installer:**
@@ -41,14 +46,14 @@ cd claude-code-tab-notify
 
 The installer adds three hooks to `~/.claude/settings.json`. A hook is a command Claude Code runs at certain moments, such as when it finishes a reply. Your existing settings stay as they are, and the installer saves a backup first (`settings.json.bak-cctn-<date>`). Running it twice changes nothing the second time.
 
-If you use Codex, the installer adds its hooks too. Open Codex, type `/hooks`, and trust the two `claude-code-tab-notify` entries. Codex won't run them until you do.
+If you use Codex, the installer adds its hooks too. Open Codex, type `/hooks`, and trust the two `agent-tab-notify` entries. Codex won't run them until you do, and asks again whenever a hook's path changes.
 
 **4. Restart Claude Code** in each open tab, so it picks up the new hooks.
 
 **5. Check that everything is in place:**
 
 ```bash
-bin/claude-code-tab-notify doctor
+bin/agent-tab-notify doctor
 ```
 
 `doctor` checks that terminal-notifier is installed, that the hooks are registered, and that this tab can be found. Fix anything it marks as a problem.
@@ -72,20 +77,20 @@ If you see two terminal-notifier entries, change the one `doctor` marks as the H
 
 ## Clear notifications when you switch tabs (optional)
 
-A notification normally clears when you click it, or when you type in its tab. To clear it the moment you switch to its tab, run the small background watcher. Run these from the `claude-code-tab-notify` folder.
+A notification normally clears when you click it, or when you type in its tab. To clear it the moment you switch to its tab, run the small background watcher. Run these from the `agent-tab-notify` folder.
 
 **1. Copy the watcher's settings file into place,** with the path pointing at your copy of this tool:
 
 ```bash
-sed "s#/Users/zackkatz/Local/dev/claude-code-tab-notify#$PWD#" \
-  launchd/com.zackkatz.claude-code-tab-notify.watch.plist \
-  > ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.watch.plist
+sed "s#/path/to/agent-tab-notify#$PWD#" \
+  launchd/com.zackkatz.agent-tab-notify.watch.plist \
+  > ~/Library/LaunchAgents/com.zackkatz.agent-tab-notify.watch.plist
 ```
 
 **2. Start it.** It also starts by itself every time you log in:
 
 ```bash
-launchctl load -w ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.watch.plist
+launchctl load -w ~/Library/LaunchAgents/com.zackkatz.agent-tab-notify.watch.plist
 ```
 
 **3. When macOS asks** whether it may control iTerm2 (or Terminal), allow it. Until you do, the watcher runs but clears nothing.
@@ -93,7 +98,7 @@ launchctl load -w ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.wat
 To stop it:
 
 ```bash
-launchctl unload -w ~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.watch.plist
+launchctl unload -w ~/Library/LaunchAgents/com.zackkatz.agent-tab-notify.watch.plist
 ```
 
 The watcher checks about once a second and costs almost nothing. It only asks your terminal which tab is in front while a notification is waiting. It works with iTerm2 and Terminal only, because Ghostty and Warp can't report which tab is in front.
@@ -135,19 +140,19 @@ Claude Code's "Claude is waiting for your input" reminder is skipped, so it does
 See every setting and its current value:
 
 ```bash
-bin/claude-code-tab-notify config
+bin/agent-tab-notify config
 ```
 
 Change one:
 
 ```bash
-bin/claude-code-tab-notify config set clear_delay 3
+bin/agent-tab-notify config set clear_delay 3
 ```
 
 Put one back to its default:
 
 ```bash
-bin/claude-code-tab-notify config unset clear_delay
+bin/agent-tab-notify config unset clear_delay
 ```
 
 Changes apply to the next notification. The watcher notices a change within a second, with no restart.
@@ -173,7 +178,7 @@ For on/off settings, `1`, `yes`, `true` and `on` all mean on. Anything else mean
 
 **Staying on screen** isn't a setting here, because macOS decides it for each app. See [Make notifications stay on screen](#make-notifications-stay-on-screen). To have notifications stay up but still go away on their own, set the alert style to Alerts and set `expire_after`.
 
-The settings are saved in `~/.config/claude-code-tab-notify/config`. The first `config set` creates it with every setting listed, each turned off with a `#` in front and explained in a comment above it:
+The settings are saved in `~/.config/agent-tab-notify/config`. (Before the rename it was `~/.config/claude-code-tab-notify/config`, which is still read if the new one doesn't exist.) The first `config set` creates it with every setting listed, each turned off with a `#` in front and explained in a comment above it:
 
 ```
 # Seconds to stay on a tab before switching to it clears its notification
@@ -185,7 +190,7 @@ To edit it by hand, remove the `# ` in front of a setting and change its value. 
 ## Troubleshooting
 
 **No notifications at all.**
-Run `bin/claude-code-tab-notify doctor`. Then check that Focus or Do Not Disturb is off, and that notifications are allowed for terminal-notifier (**System Settings**, then **Notifications**). Remember to restart Claude Code after installing.
+Run `bin/agent-tab-notify doctor`. Then check that Focus or Do Not Disturb is off, and that notifications are allowed for terminal-notifier (**System Settings**, then **Notifications**). Remember to restart Claude Code after installing.
 
 **Clicking a notification does nothing.**
 macOS probably blocked the tool from controlling your terminal. In **System Settings**, open **Privacy & Security**, then **Automation**, and allow terminal-notifier to control iTerm2 or Terminal. In Ghostty, it can also mean two tabs are open in the same folder.
@@ -221,16 +226,17 @@ Codex runs its hooks from one shared background process, so finding the tab work
 ./uninstall.sh
 ```
 
-This removes only the hooks this tool added, from both Claude Code and Codex, and saves a backup first. If you started the watcher, stop it with the `launchctl unload` command above and delete `~/Library/LaunchAgents/com.zackkatz.claude-code-tab-notify.watch.plist`.
+This removes only the hooks this tool added, from both Claude Code and Codex, and saves a backup first. If you started the watcher, stop it with the `launchctl unload` command above and delete `~/Library/LaunchAgents/com.zackkatz.agent-tab-notify.watch.plist`.
 
 ## How it works
 
-The whole tool is one bash script, `bin/claude-code-tab-notify`. The installer connects it to three Claude Code hooks:
+The whole tool is one bash script, `bin/agent-tab-notify`. The installer connects it to four Claude Code hooks:
 
 | When | Hook | What the script does |
 | --- | --- | --- |
 | Claude finishes a reply | `Stop` | posts a notification |
-| Claude needs permission or input | `Notification` | posts a notification |
+| Claude asks for permission | `PermissionRequest` | posts a notification naming the tool and what it wants to do |
+| Claude needs input | `Notification` | posts a notification, unless it only repeats the permission request |
 | You type in the tab | `UserPromptSubmit` | clears that tab's notification |
 
 To find the tab, the script asks each running terminal (through AppleScript) whether it owns this session, matching on the session's ID or its terminal device. The notification stores a small command, and clicking runs it to select that tab and clear the notification.
@@ -246,6 +252,8 @@ Architecture, internals and the pitfalls found along the way are in [AGENTS.md](
 The tests never post real notifications, and they keep their temporary files separate from yours. Tests that need a particular terminal running are skipped when it isn't.
 
 ## Credits
+
+This project was called claude-code-tab-notify until it supported Codex. The old command name, `bin/claude-code-tab-notify`, still works, and running `./install.sh` again moves your hooks to the new name.
 
 The `stop_hook_active` guard and the idea of showing the tab's title in the notification came from [stevemeisner/claude-iterm-notify](https://github.com/stevemeisner/claude-iterm-notify), which is MIT licensed.
 

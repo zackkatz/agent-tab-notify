@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.zackkatz.claude-code-tab-notify.watch</string>
+    <string>com.zackkatz.agent-tab-notify.watch</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/zackkatz/Local/dev/claude-code-tab-notify/bin/claude-code-tab-notify</string>
+        <string>/path/to/agent-tab-notify/bin/agent-tab-notify</string>
         <string>watch</string>
     </array>
 

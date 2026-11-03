@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-EXE="$REPO_DIR/bin/claude-code-tab-notify"
+EXE="$REPO_DIR/bin/agent-tab-notify"
 SETTINGS="$HOME/.claude/settings.json"
 
 [ -f "$EXE" ] || { echo "error: $EXE not found"; exit 1; }
@@ -31,21 +31,31 @@ with open(settings_path) as handle:
     settings = json.load(handle)
 
 hooks = settings.setdefault("hooks", {})
-wanted = {"Stop": "notify", "Notification": "notify", "UserPromptSubmit": "clear"}
+# PermissionRequest carries the tool and its input, so the notification can
+# say what is being asked rather than only "Claude needs your permission".
+wanted = {"Stop": "notify", "Notification": "notify", "PermissionRequest": "notify", "UserPromptSubmit": "clear"}
 added = []
+moved = []
+OLD_NAMES = ("claude-code-tab-notify", "agent-tab-notify")
 
 for event, subcommand in wanted.items():
     groups = hooks.setdefault(event, [])
-    already = any(
-        "claude-code-tab-notify" in entry.get("command", "")
-        for group in groups
-        for entry in group.get("hooks", [])
-    )
+    command = f'"{exe}" {subcommand}'
+    already = False
+    for group in groups:
+        for entry in group.get("hooks", []):
+            if any(name in entry.get("command", "") for name in OLD_NAMES):
+                already = True
+                # An entry from before the rename, or from a checkout that
+                # moved, points at the old path: point it here.
+                if entry.get("command") != command:
+                    entry["command"] = command
+                    moved.append(event)
     if already:
         continue
     # Claude Code enforces this timeout itself, so the hook does not depend on a
     # timeout(1) binary that a stock macOS does not have.
-    entry = {"type": "command", "command": f'"{exe}" {subcommand}', "timeout": 10}
+    entry = {"type": "command", "command": command, "timeout": 10}
     if groups and "matcher" not in groups[0]:
         groups[0].setdefault("hooks", []).append(entry)
     else:
@@ -56,7 +66,12 @@ with open(settings_path, "w") as handle:
     json.dump(settings, handle, indent=2)
     handle.write("\n")
 
-print("added: " + ", ".join(added) if added else "already installed; nothing changed")
+if added:
+    print("added: " + ", ".join(added))
+if moved:
+    print("updated to this checkout: " + ", ".join(moved))
+if not added and not moved:
+    print("already installed; nothing changed")
 PY
 
 echo "settings: $SETTINGS"
@@ -82,17 +97,23 @@ with open(hooks_path) as handle:
 hooks = config.setdefault("hooks", {})
 wanted = {"Stop": "notify", "UserPromptSubmit": "clear"}
 added = []
+moved = []
+OLD_NAMES = ("claude-code-tab-notify", "agent-tab-notify")
 
 for event, subcommand in wanted.items():
     groups = hooks.setdefault(event, [])
-    already = any(
-        "claude-code-tab-notify" in entry.get("command", "")
-        for group in groups
-        for entry in group.get("hooks", [])
-    )
+    command = f'CCTN_AGENT=codex "{exe}" {subcommand}'
+    already = False
+    for group in groups:
+        for entry in group.get("hooks", []):
+            if any(name in entry.get("command", "") for name in OLD_NAMES):
+                already = True
+                if entry.get("command") != command:
+                    entry["command"] = command
+                    moved.append(event)
     if already:
         continue
-    entry = {"type": "command", "command": f'CCTN_AGENT=codex "{exe}" {subcommand}', "timeout": 10}
+    entry = {"type": "command", "command": command, "timeout": 10}
     groups.append({"hooks": [entry]})
     added.append(event)
 
@@ -100,14 +121,19 @@ with open(hooks_path, "w") as handle:
     json.dump(config, handle, indent=2)
     handle.write("\n")
 
-print("codex added: " + ", ".join(added) if added else "codex already installed; nothing changed")
+if added:
+    print("codex added: " + ", ".join(added))
+if moved:
+    print("codex updated to this checkout: " + ", ".join(moved))
+if not added and not moved:
+    print("codex already installed; nothing changed")
 PY
 
     echo "codex:    $CODEX_HOOKS"
     echo "backup:   $CODEX_BACKUP"
     echo
     echo "Codex runs new hooks only after you trust them. In Codex, type /hooks and trust"
-    echo "the two claude-code-tab-notify entries."
+    echo "the two agent-tab-notify entries. (Codex asks again after a hook's path changes.)"
 fi
 
 echo

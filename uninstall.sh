@@ -28,7 +28,7 @@ for event in list(hooks):
     groups = hooks[event]
     for group in groups:
         entries = group.get("hooks", [])
-        kept = [e for e in entries if "claude-code-tab-notify" not in e.get("command", "")]
+        kept = [e for e in entries if not any(n in e.get("command", "") for n in ("agent-tab-notify", "claude-code-tab-notify"))]
         removed += len(entries) - len(kept)
         group["hooks"] = kept
     # Drop groups this emptied, and events left with no groups, so the file does

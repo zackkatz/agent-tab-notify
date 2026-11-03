@@ -1,4 +1,4 @@
-# AGENTS.md — claude-code-tab-notify
+# AGENTS.md — agent-tab-notify
 
 > Claude Code notifications that take you to the right terminal tab, and clear when you get there.
 
@@ -9,7 +9,7 @@ asks for input, it posts a macOS notification through `terminal-notifier` carryi
 action that selects the exact terminal tab the session is running in. A companion launchd
 agent clears that notification when you arrive at the tab.
 
-**Main entry point:** `bin/claude-code-tab-notify` (about 900 lines, one file, no dependencies
+**Main entry point:** `bin/agent-tab-notify` (about 900 lines, one file, no dependencies
 beyond `terminal-notifier` and macOS)
 
 **Architecture style:** subcommand dispatch at the bottom of one script; everything above is
@@ -21,7 +21,7 @@ the whole toolchain.
 ## Repository Map
 
 ```
-bin/claude-code-tab-notify    the entire program
+bin/agent-tab-notify    the entire program
 install.sh                    wires the hooks into ~/.claude/settings.json (backs it up first)
 uninstall.sh                  removes them
 launchd/                      the watch agent's plist
@@ -32,7 +32,7 @@ test/run.sh                   the suite; stubs terminal-notifier and asserts on 
 
 ### Subcommands
 
-The dispatch block is at the end of `bin/claude-code-tab-notify`, guarded on `BASH_SOURCE`.
+The dispatch block is at the end of `bin/agent-tab-notify`, guarded on `BASH_SOURCE`.
 
 | Subcommand | Runs from | Does |
 |---|---|---|
@@ -121,7 +121,7 @@ honest:
 
 ## Settings
 
-User settings live in `~/.config/claude-code-tab-notify/config` (`$CCTN_CONFIG` overrides the
+User settings live in `~/.config/agent-tab-notify/config` (`$CCTN_CONFIG` overrides the
 path), as `CCTN_NAME="value"` lines. `SETTINGS_TABLE` near the top of the script is the single
 list of names, defaults and descriptions; `config` prints from it and `config set` refuses
 any name not in it. `load_config()` parses the file as data (never `source`d), skips names
@@ -156,7 +156,7 @@ notification first appears counts as already visited, not arrived at), `last_han
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CCTN_GROUP_PREFIX` | `claude-code-tab-notify` | notification group namespace; the suite sets `cctn-test` |
+| `CCTN_GROUP_PREFIX` | `agent-tab-notify` | notification group namespace; the suite sets `cctn-test` |
 | `CCTN_TITLE_PREFIX` | (empty) | text before the tab name in the title; set it to tell these apart from iTerm2's own Claude Code notifications |
 | `CCTN_PENDING_DIR` | `$HOME/.cache/cctn-pending` | marker files the watch loop reads |
 | `CCTN_WATCH_INTERVAL` | `1` | watch poll seconds |
@@ -164,24 +164,41 @@ notification first appears counts as already visited, not arrived at), `last_han
 | `CCTN_PRUNE_INTERVAL` | `300` | seconds between the watch loop's stale-marker sweeps |
 | `CCTN_ALWAYS_NOTIFY` | unset | overrides the unroutable-session skip |
 | `CCTN_BANNER_CHARS` | `150` | most characters of the reply `clean_reply` keeps, cut at a word |
-| `CCTN_CONFIG` | `~/.config/claude-code-tab-notify/config` | settings file path; the suite points it at a temp file |
+| `CCTN_CONFIG` | `~/.config/agent-tab-notify/config` | settings file path; the suite points it at a temp file |
 | other `CCTN_*` settings | see `SETTINGS_TABLE` | any setting can also come from the environment, which wins over the file |
 | `CCTN_AGENT` | unset | `codex` marks a Codex hook; a payload with `turn_id` counts too |
 | `CODEX_HOME` | `~/.codex` | where `install.sh` writes Codex's `hooks.json` and where the thread-name lookup reads `state_*.sqlite` |
 
 ## Claude Code hook wiring
 
-`install.sh` adds three entries to `~/.claude/settings.json`, backing the file up to
-`settings.json.bak-cctn-<timestamp>` first and skipping any event that already mentions
-this tool:
+`install.sh` adds four entries to `~/.claude/settings.json`, backing the file up to
+`settings.json.bak-cctn-<timestamp>` first. An event that already has an entry naming this
+tool (either name) is not added again; its command is rewritten to this checkout's path
+instead, which is how a rename or a moved checkout is picked up:
 
 | Event | Subcommand |
 |---|---|
 | `Stop` | `notify` |
 | `Notification` | `notify` |
+| `PermissionRequest` | `notify` |
 | `UserPromptSubmit` | `clear` |
 
+`PermissionRequest` carries `tool_name` and `tool_input` (Claude Code 2.1.317), which
+`permission_summary()` turns into "Wants to run: <command>", "Wants to edit: <path>", or
+"Wants to use <server> <tool>: <first text argument>". The `Notification` event Claude Code
+sends for the same prompt (`notification_type: permission_prompt`) says only "Claude needs
+your permission"; it is dropped when this session posted a PermissionRequest notification in
+the last ten minutes (a touch file in `$TMPDIR/cctn-permission/<session_id>`), so it cannot
+replace the detailed one.
+
 The watch agent is separate and not installed by `install.sh`; see the README.
+
+**Renamed from claude-code-tab-notify.** `bin/claude-code-tab-notify` is a committed symlink
+to `bin/agent-tab-notify`, so old hook commands and the click callbacks stored in
+already-delivered notifications keep working; `SELF` resolves the symlink so new callbacks
+use the new name. The settings file falls back to `~/.config/claude-code-tab-notify/config`
+when the new path does not exist. The `CCTN_` prefix for settings and the
+`~/.cache/cctn-pending` marker directory kept their names.
 
 ## Codex hook wiring
 
@@ -228,8 +245,8 @@ so the header is the help text.
 
 ```bash
 bash test/run.sh                      # the suite
-bin/claude-code-tab-notify doctor     # checks macOS, terminal-notifier, alert style, resolution
-bin/claude-code-tab-notify resolve    # what this session resolves to
+bin/agent-tab-notify doctor     # checks macOS, terminal-notifier, alert style, resolution
+bin/agent-tab-notify resolve    # what this session resolves to
 ./install.sh                          # wire the hooks
 ```
 
@@ -247,7 +264,7 @@ pass `CCTN_PENDING_DIR` through explicitly.
 
 1. **Every subcommand but `watch` reads hook JSON from stdin and hangs when stdin is a pipe
    with nothing coming.** `read_stdin` skips the read only when stdin is a tty, so
-   `bash bin/claude-code-tab-notify notify` from a script or harness blocks forever with no
+   `bash bin/agent-tab-notify notify` from a script or harness blocks forever with no
    output. Pipe a payload in or redirect from `/dev/null`. A hang here is the harness, not
    the hook.
 2. **`test/run.sh` fails one test on a clean tree**: `parses hook JSON without jq`. Run the
