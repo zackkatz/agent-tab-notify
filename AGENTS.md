@@ -114,7 +114,7 @@ honest:
 | Variable | Default | Purpose |
 |---|---|---|
 | `CCTN_GROUP_PREFIX` | `claude-code-tab-notify` | notification group namespace; the suite sets `cctn-test` |
-| `CCTN_TITLE_PREFIX` | `cctn: ` | distinguishes these from iTerm2's own Claude Code notifications |
+| `CCTN_TITLE_PREFIX` | (empty) | text before the tab name in the title; set it to tell these apart from iTerm2's own Claude Code notifications |
 | `CCTN_PENDING_DIR` | `$HOME/.cache/cctn-pending` | marker files the watch loop reads |
 | `CCTN_WATCH_INTERVAL` | `1` | watch poll seconds |
 | `CCTN_WATCH_QUIET` | unset | silences watch's diagnostics |

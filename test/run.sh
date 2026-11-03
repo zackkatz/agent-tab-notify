@@ -130,10 +130,27 @@ payload Notification "hello" sid-post | PATH="$stub:$PATH" bash "$EXE" notify
 check "posts one notification" "1" "$(call_count "$stub")"
 check "carries the message" "hello" "$(arg_of "$stub" -message)"
 case "$(arg_of "$stub" -title)" in
-    "cctn: "*) ok "title is prefixed so it is distinguishable from iTerm's own" ;;
-    *) fail "title is prefixed" "got [$(arg_of "$stub" -title)]" ;;
+    "cctn: "*) fail "title has no prefix by default" "got [$(arg_of "$stub" -title)]" ;;
+    ?*) ok "title has no prefix by default" ;;
+    *) fail "title has no prefix by default" "title is empty" ;;
 esac
 rm -rf "$stub"
+
+# The payload's reply wins over the transcript, which can lag one reply behind.
+stub=$(make_stub notty)
+stale_transcript=$(mktemp)
+printf '%s\n' '{"message":{"role":"assistant","content":[{"type":"text","text":"OLD REPLY"}]}}' > "$stale_transcript"
+printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"sid-fresh","stop_hook_active":false,"transcript_path":"%s","last_assistant_message":"NEW REPLY"}' \
+    "$PWD" "$stale_transcript" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "uses the payload's reply over a stale transcript" "NEW REPLY" "$(arg_of "$stub" -message)"
+rm -rf "$stub"
+
+# Tamper check: without the payload field, the transcript is still read.
+stub=$(make_stub notty)
+printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"sid-fresh2","stop_hook_active":false,"transcript_path":"%s"}' \
+    "$PWD" "$stale_transcript" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "falls back to the transcript" "OLD REPLY" "$(arg_of "$stub" -message)"
+rm -rf "$stub" "$stale_transcript"
 
 # Two sessions with no tab and no tty must still not overwrite each other; the
 # Claude session id is the only thing left to tell them apart.
@@ -198,7 +215,8 @@ if [ -n "$tty" ]; then
         "nohup "*"focus 'tty:$tty'"*"&") ok "click target falls back to the tty, detached" ;;
         *) fail "click target falls back to the tty, detached" "got [$got_exec]" ;;
     esac
-    check "reuses the last known tab name" "CACHED TAB NAME" "$(arg_of "$stub" -subtitle)"
+    check "reuses the last known tab name" "CACHED TAB NAME" "$(arg_of "$stub" -title)"
+    check "the tab name is the only heading (no subtitle)" "" "$(arg_of "$stub" -subtitle)"
     rm -rf "$stub"
 
     if [ -n "$saved" ]; then printf '%s' "$saved" > "$cache"; else rm -f "$cache"; fi
@@ -233,11 +251,12 @@ codex_payload() {
         "$1" "$PWD" "$2" "${3:-}"
 }
 
-stub=$(make_stub)
+# No tab, so the title falls back to the agent label, which is what this checks.
+stub=$(make_stub notty)
 codex_payload Stop 0a0a-codex-title ',"last_assistant_message":"All done here"' \
     | PATH="$stub:$PATH" bash "$EXE" notify
 case "$(arg_of "$stub" -title)" in
-    "cctn: Codex ("*) ok "a turn_id payload is labeled Codex" ;;
+    "Codex ("*"): Task Complete") ok "a turn_id payload is labeled Codex" ;;
     *) fail "a turn_id payload is labeled Codex" "got [$(arg_of "$stub" -title)]" ;;
 esac
 check "uses Codex's last_assistant_message" "All done here" "$(arg_of "$stub" -message)"

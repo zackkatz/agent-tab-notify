@@ -22,9 +22,9 @@ SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
 # Overridable so the test suite can post without touching real notifications.
 GROUP_PREFIX="${CCTN_GROUP_PREFIX:-claude-code-tab-notify}"
 
-# iTerm2's own Claude Code integration posts its own notifications, so a title
-# prefix is the only way to tell at a glance which one you are looking at.
-TITLE_PREFIX="${CCTN_TITLE_PREFIX:-cctn: }"
+# Empty by default so the title is just the tab name. Set CCTN_TITLE_PREFIX to
+# tell these apart from iTerm2's own Claude Code notifications.
+TITLE_PREFIX="${CCTN_TITLE_PREFIX:-}"
 
 TERMINAL_NOTIFIER_BUNDLE_ID="fr.julienxx.oss.terminal-notifier"
 
@@ -395,15 +395,21 @@ cmd_notify() {
     [ -n "$payload_cwd" ] || payload_cwd=$(pwd)
     session_dir=$(basename "$payload_cwd")
 
+    # Claude hands over the final reply in the payload. The transcript can lag
+    # behind it when the hook fires, which showed the reply before the last one,
+    # so read the transcript only when the payload has nothing.
+    local last_assistant_msg=""
+    if [ "$hook_event" = "Stop" ]; then
+        last_assistant_msg=$(json_get '.last_assistant_message' | tr '\n' ' ' | sed 's/ *$//' | cut -c1-100)
+    fi
     # Tool calls and thinking blocks also live in content[], so select on type
     # rather than trusting the first element.
-    local last_assistant_msg=""
-    if [ -f "$transcript_path" ] && [ "$hook_event" = "Stop" ] && command -v jq >/dev/null 2>&1; then
+    if [ -z "$last_assistant_msg" ] && [ -f "$transcript_path" ] && [ "$hook_event" = "Stop" ] && command -v jq >/dev/null 2>&1; then
         last_assistant_msg=$(tail -40 "$transcript_path" 2>/dev/null | \
             jq -r 'select(.message.role == "assistant")
                    | [.message.content[]? | select(.type == "text") | .text]
                    | join(" ")' 2>/dev/null | \
-            grep -v '^$' | tail -1 | tr '\n' ' ' | cut -c1-100)
+            grep -v '^$' | tail -1 | tr '\n' ' ' | sed 's/ *$//' | cut -c1-100)
     fi
     # Codex hands over the reply itself rather than a transcript to dig through.
     if [ "$AGENT" = "codex" ]; then
@@ -546,10 +552,19 @@ except Exception:
         "${raw_tty:-none}" "${handle:-NONE}" "${tab_title:-NONE}" >> "$log" 2>/dev/null
     tail -300 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log" 2>/dev/null
 
+    # One bold line: the tab name says which session this is better than the
+    # agent and directory do. Without a tab name, fall back to those plus the
+    # event, so the notification still says what happened.
+    local heading
+    if [ -n "$tab_title" ]; then
+        heading="$tab_title"
+    else
+        heading="$(agent_label) ($session_dir): $title"
+    fi
+
     local args
     args=(
-        -title "${TITLE_PREFIX}$(agent_label) ($session_dir)"
-        -subtitle "${tab_title:-$title}"
+        -title "${TITLE_PREFIX}${heading}"
         -message "$msg"
         -sound "$sound"
         -group "$group_key"
