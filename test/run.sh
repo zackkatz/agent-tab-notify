@@ -167,6 +167,49 @@ printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"sid-fresh2","stop_hoo
 check "falls back to the transcript" "OLD REPLY" "$(arg_of "$stub" -message)"
 rm -rf "$stub" "$stale_transcript"
 
+# A Stop that only waits for background agents stays quiet until the last one ends.
+stop_with_tasks() {
+    printf '{"hook_event_name":"Stop","cwd":"%s","session_id":"%s","stop_hook_active":false,"last_assistant_message":"reply","transcript_path":"%s","background_tasks":%s}' \
+        "$PWD" "$1" "${3:-}" "$2"
+}
+stub=$(make_stub notty)
+stop_with_tasks sid-ag1 '[{"id":"a1","type":"subagent","status":"running","description":"x"}]' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "skips a Stop while a subagent runs" "0" "$(call_count "$stub")"
+stop_with_tasks sid-ag2 '[{"id":"w1","type":"workflow","status":"running","description":"x"}]' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "skips a Stop while a workflow runs" "0" "$(call_count "$stub")"
+stop_with_tasks sid-ag3 '[{"id":"r1","type":"cloud session","status":"running","description":"x"}]' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "skips a Stop while a cloud agent runs" "0" "$(call_count "$stub")"
+stop_with_tasks sid-ag4 '[{"id":"a1","type":"subagent","status":"running","description":"x"}]' | CCTN_NOTIFY_WHILE_AGENTS_RUN=1 CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "notify_while_agents_run posts anyway" "1" "$(call_count "$stub")"
+rm -rf "$stub"
+
+stub=$(make_stub notty)
+stop_with_tasks sid-ag5 '[]' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "posts when nothing is in flight" "1" "$(call_count "$stub")"
+stop_with_tasks sid-ag6 '[{"id":"b1","type":"shell","status":"running","description":"dev server","command":"npm start"}]' | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "a background command does not hold a notification back" "2" "$(call_count "$stub")"
+rm -rf "$stub"
+
+# An agent waiting on its own command is gone from the list; only the command is.
+waiting_transcript=$(mktemp)
+printf '%s\n' '{"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n<summary>Agent \"x\" is waiting on its own background work</summary>\n</task-notification>"}}' \
+    '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"no verdict yet"}]}}' > "$waiting_transcript"
+finished_transcript=$(mktemp)
+printf '%s\n' '{"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n<summary>Agent \"x\" finished</summary>\n</task-notification>"}}' > "$finished_transcript"
+quoted_transcript=$(mktemp)
+printf '%s\n' '{"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":"why did it say is waiting on its own background work</summary>"}}' > "$quoted_transcript"
+shell_task='[{"id":"b1","type":"shell","status":"running","description":"composer install"}]'
+stub=$(make_stub notty)
+stop_with_tasks sid-ag7 "$shell_task" "$waiting_transcript" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "skips the turn an agent's waiting notice started" "0" "$(call_count "$stub")"
+stop_with_tasks sid-ag8 "$shell_task" "$finished_transcript" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "posts the turn a finished agent started" "1" "$(call_count "$stub")"
+stop_with_tasks sid-ag9 "$shell_task" "$quoted_transcript" | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "posts when you only quote the waiting notice" "2" "$(call_count "$stub")"
+stop_with_tasks sid-ag10 "$shell_task" /nonexistent/transcript | CCTN_ALWAYS_NOTIFY=1 PATH="$stub:$PATH" bash "$EXE" notify
+check "posts when the transcript is missing" "3" "$(call_count "$stub")"
+rm -rf "$stub" "$waiting_transcript" "$finished_transcript" "$quoted_transcript"
+
 # The banner gets plain text: no Markdown, no bare lead-in, cut at a word.
 reply_of() {
     local stub; stub=$(make_stub notty)

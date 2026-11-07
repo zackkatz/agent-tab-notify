@@ -43,6 +43,7 @@ fi
 SETTINGS_TABLE='CCTN_NOTIFY_ON_DONE|1|Notify when Claude finishes a reply
 CCTN_NOTIFY_ON_INPUT|1|Notify when Claude needs permission or input
 CCTN_NOTIFY_ON_IDLE|0|Notify for Claude Code'"'"'s "waiting for your input" reminder, which replaces the reply
+CCTN_NOTIFY_WHILE_AGENTS_RUN|0|Notify when Claude stops but background agents are still working
 CCTN_NOTIFY_WHEN_FOCUSED|0|Notify even when you are looking at that session'"'"'s tab
 CCTN_AWAY_AFTER|60|Seconds without keyboard or mouse use after which the tab in front gets notified too (0 = never)
 CCTN_SOUND_DONE|Blow|Sound when Claude finishes (a name from /System/Library/Sounds, or none)
@@ -677,6 +678,49 @@ print(text)
 ' "$BANNER_CHARS" 2>/dev/null
 }
 
+# Whether Claude stopped only to wait for background agents. Claude Code lists
+# the work in flight in the Stop payload, and the turn that ends when the last
+# agent finishes notifies as usual. An agent that is itself waiting on a command
+# counts as completed and leaves the list, so that case is read from the
+# notification that started this turn; its command is still listed, which keeps
+# the transcript unread for every other Stop.
+waiting_on_agents() {
+    printf '%s' "$INPUT" | /usr/bin/python3 -c '
+import json, os, sys
+
+AGENT_TYPES = {"subagent", "workflow", "teammate", "cloud session"}
+WAITING = "is waiting on its own background work</summary>"
+
+def turn_start(path):
+    with open(path, "rb") as transcript:
+        transcript.seek(0, os.SEEK_END)
+        transcript.seek(max(0, transcript.tell() - 262144))
+        lines = transcript.read().splitlines()
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("type") == "user" and row.get("origin"):
+            return row
+    return {}
+
+try:
+    payload = json.load(sys.stdin)
+    tasks = payload.get("background_tasks") or []
+    if any(task.get("type") in AGENT_TYPES for task in tasks):
+        sys.exit(0)
+    if tasks:
+        row = turn_start(payload.get("transcript_path") or "")
+        content = json.dumps(row.get("message", {}).get("content", ""))
+        if row.get("origin", {}).get("kind") == "task-notification" and WAITING in content:
+            sys.exit(0)
+except (OSError, ValueError, AttributeError):
+    pass
+sys.exit(1)
+' 2>/dev/null
+}
+
 # ---------------------------------------------------------------- notify ----
 
 cmd_notify() {
@@ -699,6 +743,13 @@ cmd_notify() {
         Stop) is_on "$(setting CCTN_NOTIFY_ON_DONE)" || exit 0 ;;
         Notification|PermissionRequest) is_on "$(setting CCTN_NOTIFY_ON_INPUT)" || exit 0 ;;
     esac
+
+    if [ "$hook_event" = "Stop" ] && ! is_on "$(setting CCTN_NOTIFY_WHILE_AGENTS_RUN)" && waiting_on_agents; then
+        printf '%s event=%s session=%s SKIPPED (background agents running)\n' \
+            "$(date '+%H:%M:%S')" "$hook_event" "$(json_get '.session_id' | cut -c1-8)" \
+            >> "${TMPDIR:-/tmp}/cctn.log" 2>/dev/null
+        exit 0
+    fi
 
     # About a minute after a reply, Claude Code sends a "waiting for your input"
     # reminder. Posting it would replace the notification that shows the reply

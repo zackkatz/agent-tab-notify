@@ -135,6 +135,8 @@ No notification is sent while you're looking at that session's tab, since you ca
 
 Claude Code's "Claude is waiting for your input" reminder is skipped, so it doesn't replace the notification that shows Claude's reply. Turn it on with `notify_on_idle`.
 
+While background agents are still working, Claude's replies don't notify you, since nothing needs you yet. The reply after the last agent finishes does. Background commands don't hold a notification back, only agents. Turn this off with `notify_while_agents_run`.
+
 ## Settings
 
 See every setting and its current value:
@@ -162,6 +164,7 @@ Changes apply to the next notification. The watcher notices a change within a se
 | `notify_on_done` | Notify when Claude finishes a reply | `1` (on) |
 | `notify_on_input` | Notify when Claude needs permission or input | `1` (on) |
 | `notify_on_idle` | Notify for Claude Code's "Claude is waiting for your input" reminder, sent about a minute after a reply. Off by default, because it would replace the notification that shows the reply | `0` (off) |
+| `notify_while_agents_run` | Notify when Claude stops while background agents are still working, including an agent that is waiting on its own background work | `0` (off) |
 | `notify_when_focused` | Notify even when the session's tab is the one in front. Off by default, since you can already see it. Works in iTerm2 and Terminal; Ghostty and Warp tabs always notify | `0` (off) |
 | `away_after` | When you haven't used the keyboard or mouse for this many seconds, the tab in front gets a notification too, so a finished task still calls you back. `0` never notifies for the tab in front | `60` |
 | `sound_done` | Sound when Claude finishes. Any name from `/System/Library/Sounds`, such as `Ping`, or `none` | `Blow` |

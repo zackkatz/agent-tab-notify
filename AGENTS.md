@@ -148,6 +148,14 @@ The `Notification` event's `notification_type` (Claude Code 2.1.317: `permission
 and others) drives `notify_on_idle`: `idle_prompt` is skipped by default, as is a payload
 with no type whose message is "Claude is waiting for your input" (older versions).
 
+`notify_while_agents_run` (default off): the Stop payload's `background_tasks` (Claude Code
+2.1.319) lists running or pending backgrounded work, each with a `type` label. `waiting_on_agents()`
+skips the post for `subagent`, `workflow`, `teammate` and `cloud session`, but not `shell` or
+`monitor`, because a dev server or a long watch would otherwise silence a session for good.
+A subagent "waiting on its own background work" has status `completed`, so it is not in that list;
+only its command is. That case comes from the turn's `<task-notification>` row at the end of the
+transcript, read only when `background_tasks` is not empty. Codex sends no such field and always posts.
+
 Watch loop states: `fresh` (nothing was pending last tick, so the tab you are on when a
 notification first appears counts as already visited, not arrived at), `last_handle`,
 `arrived_at` and `cleared` (one clear per visit, after `clear_delay` seconds on the tab).
