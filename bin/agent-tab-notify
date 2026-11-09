@@ -310,11 +310,31 @@ warp_handle() {
 ORCA_BUNDLE_ID="com.stablyai.orca"
 
 orca_handle() {
+    # A claude run started by a session (a script calling `claude -p`, for one)
+    # inherits that tab's Orca variables, and its own Stop would post as that
+    # tab every time it finishes.
+    nested_session && return 0
     if [ "${TERM_PROGRAM:-}" = "Orca" ] && [[ "${ORCA_TERMINAL_HANDLE:-}" =~ ^term_[0-9A-Za-z-]+$ ]]; then
         echo "orca:$ORCA_TERMINAL_HANDLE"
     elif [ "${ORCA_STRUCTURED_SESSION:-}" = "1" ] && [[ "${ORCA_AGENT_SESSION_ID:-}" =~ ^[0-9A-Za-z_-]+$ ]]; then
         echo "orcachat:$ORCA_AGENT_SESSION_ID"
     fi
+}
+
+# True when the agent running this hook was started by another agent: two or
+# more claude or codex processes above it. The tab's own session has one.
+nested_session() {
+    local pid=$PPID hops=0 found=0 ppid comm
+    while [ "$hops" -lt 20 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+        read -r ppid comm <<<"$(ps -o ppid=,comm= -p "$pid" 2>/dev/null)"
+        [ -n "$ppid" ] || return 1
+        case "${comm##*/}" in
+            claude|codex) found=$((found + 1)); [ "$found" -ge 2 ] && return 0 ;;
+        esac
+        pid=$ppid
+        hops=$((hops + 1))
+    done
+    return 1
 }
 
 # True for a handle whose terminal cannot say which tab is in front.

@@ -274,6 +274,17 @@ check "ignores an Orca handle outside Orca" "" \
 check "reads an Orca chat's session" "orcachat:claude_a67a356c_d942" \
     "$(TERM_PROGRAM= ORCA_STRUCTURED_SESSION=1 ORCA_AGENT_SESSION_ID=claude_a67a356c_d942 orca_handle)"
 
+# A claude run started by a session inherits its tab's Orca variables. Every
+# process above this one reports itself as claude, so this run is nested.
+nested_dir=$(mktemp -d)
+printf '#!/bin/bash\necho "2 /usr/local/bin/claude"\n' > "$nested_dir/ps"
+chmod +x "$nested_dir/ps"
+check "a nested claude run in an Orca tab gets no Orca handle" "" \
+    "$(PATH="$nested_dir:$PATH" TERM_PROGRAM=Orca ORCA_TERMINAL_HANDLE="$orca_term" orca_handle)"
+check "a nested claude run in an Orca chat gets no Orca handle" "" \
+    "$(PATH="$nested_dir:$PATH" TERM_PROGRAM= ORCA_STRUCTURED_SESSION=1 ORCA_AGENT_SESSION_ID=claude_x orca_handle)"
+rm -rf "$nested_dir"
+
 stub=$(make_stub noresolve)
 # Orca started from an iTerm2 tab inherits its ITERM_SESSION_ID, which must not win.
 payload Stop "orca" sid-orca | ITERM_SESSION_ID="w0t0p0:${BASE#iterm:}" TERM_PROGRAM=Orca \
