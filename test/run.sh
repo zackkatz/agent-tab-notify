@@ -23,6 +23,10 @@ export CCTN_NOTIFY_WHEN_FOCUSED=1
 # marker the suite leaves there keeps that agent polling iTerm every second.
 export CCTN_PENDING_DIR; CCTN_PENDING_DIR=$(mktemp -d)
 trap 'rm -rf "$CCTN_PENDING_DIR" "$TMPDIR"' EXIT
+# Run from an Orca tab, every test would take the Orca path. The Orca tests set
+# these themselves.
+unset ORCA_TERMINAL_HANDLE ORCA_STRUCTURED_SESSION ORCA_AGENT_SESSION_ID
+[ "${TERM_PROGRAM:-}" = "Orca" ] && unset TERM_PROGRAM
 
 PASS=0; FAIL=0; SKIP=0
 
@@ -249,6 +253,65 @@ check "ignores a Warp link outside Warp" "" \
     "$(TERM_PROGRAM=iTerm.app WARP_FOCUS_URL="warp://session/$warp_id" warp_handle)"
 check "keeps a preview channel's scheme" "warp:warppreview:$warp_id" \
     "$(TERM_PROGRAM=WarpTerminal WARP_FOCUS_URL="warppreview://session/$warp_id" warp_handle)"
+
+# Orca names each terminal tab in $ORCA_TERMINAL_HANDLE, and its CLI switches to
+# a tab by that handle. A stub CLI stands in for Orca and records its calls.
+orca_term=term_32c34ec4-9a15-4290-82eb-4fccc30221ee
+orca_dir=$(mktemp -d)
+cat > "$orca_dir/orca" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$orca_dir/calls.txt"
+[ "\$1 \$2" = "terminal show" ] && printf '{"ok":true,"result":{"terminal":{"handle":"%s","title":"Design Studio"}}}\n' "\$4"
+exit 0
+EOF
+chmod +x "$orca_dir/orca"
+check "reads an Orca terminal's handle" "orca:$orca_term" \
+    "$(TERM_PROGRAM=Orca ORCA_TERMINAL_HANDLE="$orca_term" orca_handle)"
+check "ignores a malformed Orca handle" "" \
+    "$(TERM_PROGRAM=Orca ORCA_TERMINAL_HANDLE='term_x;rm -rf /' ORCA_STRUCTURED_SESSION= orca_handle)"
+check "ignores an Orca handle outside Orca" "" \
+    "$(TERM_PROGRAM=iTerm.app ORCA_TERMINAL_HANDLE="$orca_term" ORCA_STRUCTURED_SESSION= orca_handle)"
+check "reads an Orca chat's session" "orcachat:claude_a67a356c_d942" \
+    "$(TERM_PROGRAM= ORCA_STRUCTURED_SESSION=1 ORCA_AGENT_SESSION_ID=claude_a67a356c_d942 orca_handle)"
+
+stub=$(make_stub noresolve)
+# Orca started from an iTerm2 tab inherits its ITERM_SESSION_ID, which must not win.
+payload Stop "orca" sid-orca | ITERM_SESSION_ID="w0t0p0:${BASE#iterm:}" TERM_PROGRAM=Orca \
+    ORCA_TERMINAL_HANDLE="$orca_term" ORCA_CLI_COMMAND="$orca_dir/orca" CCTN_ALWAYS_NOTIFY=1 \
+    PATH="$stub:$PATH" bash "$EXE" notify
+case "$(arg_of "$stub" -execute)" in
+    *"focus 'orca:$orca_term'"*) ok "an Orca tab's click switches to it" ;;
+    *) fail "an Orca tab's click switches to it" "got [$(arg_of "$stub" -execute)]" ;;
+esac
+check "an Orca notification is titled by its tab" "Design Studio" "$(arg_of "$stub" -title)"
+check "an Orca notification is grouped by its tab" "cctn-test:$orca_term" "$(arg_of "$stub" -group)"
+check "an Orca tab writes no marker" "" "$(ls "$CCTN_PENDING_DIR" | grep "$orca_term")"
+rm -rf "$stub"
+
+# A chat tab has no tty, so without its own handle it would be skipped as
+# unroutable whenever iTerm2's integration is installed.
+stub=$(make_stub notty)
+payload Stop "chat" sid-orcachat | TERM_PROGRAM= ORCA_STRUCTURED_SESSION=1 ORCA_AGENT_SESSION_ID=claude_chat1 \
+    PATH="$stub:$PATH" bash "$EXE" notify
+check "an Orca chat posts" "1" "$(call_count "$stub")"
+case "$(arg_of "$stub" -execute)" in
+    *"focus 'orcachat:claude_chat1'"*) ok "an Orca chat's click raises Orca" ;;
+    *) fail "an Orca chat's click raises Orca" "got [$(arg_of "$stub" -execute)]" ;;
+esac
+rm -rf "$stub"
+
+# The click: switch to the tab, then raise Orca, since switching does not.
+open_dir=$(mktemp -d)
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/calls.txt"\n' "$open_dir" > "$open_dir/open"
+chmod +x "$open_dir/open"
+: > "$orca_dir/calls.txt"
+ORCA_CLI_COMMAND="$orca_dir/orca" PATH="$open_dir:$PATH" bash "$EXE" focus "orca:$orca_term"
+check "clicking switches Orca to the tab" "terminal switch --terminal $orca_term --json" "$(cat "$orca_dir/calls.txt")"
+check "clicking raises Orca" "-b com.stablyai.orca" "$(cat "$open_dir/calls.txt")"
+: > "$open_dir/calls.txt"
+PATH="$open_dir:$PATH" bash "$EXE" focus "orcachat:claude_chat1"
+check "clicking a chat raises Orca" "-b com.stablyai.orca" "$(cat "$open_dir/calls.txt")"
+rm -rf "$open_dir" "$orca_dir"
 
 # With no tab name, the session's own name is the title: the /rename one over
 # the generated one, and the last of each.

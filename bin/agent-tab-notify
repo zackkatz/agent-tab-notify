@@ -172,6 +172,8 @@ pending_path() {
 #   terminal:<tty>           Terminal.app exposes tty per tab
 #   ghostty:<tab id>         matched by working directory, only when unambiguous
 #   tty:<tty>                unresolved; the click works out which terminal owns it
+#   orca:<term_ handle>      an Orca terminal tab, from $ORCA_TERMINAL_HANDLE
+#   orcachat:<session id>    an Orca chat tab; the click can only raise Orca
 #
 # The tty handle exists because asking a terminal anything requires AppleScript,
 # which can stall under load while several sessions post at once. Reading the tty
@@ -271,7 +273,7 @@ detect_agent() {
 forget_daemon_env() {
     [ "$AGENT" = "codex" ] || return 0
     [ -n "$(find_ancestor_tty)" ] && return 0
-    unset ITERM_SESSION_ID TMUX TMUX_PANE WARP_FOCUS_URL
+    unset ITERM_SESSION_ID TMUX TMUX_PANE WARP_FOCUS_URL ORCA_TERMINAL_HANDLE
 }
 
 # Warp's stable build is dev.warp.Warp-Stable; older builds used dev.warp.Warp.
@@ -297,6 +299,52 @@ warp_handle() {
     [ "${TERM_PROGRAM:-}" = "WarpTerminal" ] || return 0
     [[ "${WARP_FOCUS_URL:-}" =~ ^(warp[a-z]*)://session/([0-9a-f]{32})$ ]] || return 0
     echo "warp:${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+}
+
+# Orca gives each terminal tab's shell its own handle in $ORCA_TERMINAL_HANDLE,
+# and its CLI switches to a tab by that handle. Chat tabs have no terminal and
+# no tty; Orca marks them with $ORCA_STRUCTURED_SESSION and names the session in
+# $ORCA_AGENT_SESSION_ID. Its CLI cannot switch to a chat tab, so that handle
+# only says the session is in Orca. Prints the handle, or nothing outside Orca
+# or when the value is not that shape.
+ORCA_BUNDLE_ID="com.stablyai.orca"
+
+orca_handle() {
+    if [ "${TERM_PROGRAM:-}" = "Orca" ] && [[ "${ORCA_TERMINAL_HANDLE:-}" =~ ^term_[0-9A-Za-z-]+$ ]]; then
+        echo "orca:$ORCA_TERMINAL_HANDLE"
+    elif [ "${ORCA_STRUCTURED_SESSION:-}" = "1" ] && [[ "${ORCA_AGENT_SESSION_ID:-}" =~ ^[0-9A-Za-z_-]+$ ]]; then
+        echo "orcachat:$ORCA_AGENT_SESSION_ID"
+    fi
+}
+
+# True for a handle whose terminal cannot say which tab is in front.
+orca_or_warp() {
+    case "${1%%:*}" in orca|orcachat|warp) return 0 ;; esac
+    return 1
+}
+
+# The click runs from terminal-notifier, which has none of Orca's variables, so
+# the app's own copy is the fallback.
+orca_cli() {
+    local cli
+    for cli in "${ORCA_CLI_COMMAND:-}" /Applications/Orca.app/Contents/Resources/bin/orca \
+               "$HOME/Applications/Orca.app/Contents/Resources/bin/orca"; do
+        [ -n "$cli" ] && [ -x "$cli" ] && { echo "$cli"; return 0; }
+    done
+}
+
+# The tab title Orca shows for a terminal handle. About 150ms.
+orca_tab_title() {
+    local cli
+    cli=$(orca_cli)
+    [ -n "$cli" ] || return 0
+    bounded 3 "$cli" terminal show --terminal "$1" --json | /usr/bin/python3 -c '
+import json, sys
+try:
+    print((json.load(sys.stdin).get("result") or {}).get("terminal", {}).get("title") or "")
+except Exception:
+    print("")
+' 2>/dev/null
 }
 
 agent_label() {
@@ -856,6 +904,12 @@ except Exception:
         fi
         [ -n "$job_name" ] || job_name="${CLAUDE_CODE_SESSION_NAME:-}"
         tab_title="background job${job_name:+: $job_name}"
+    elif [ -n "$(orca_handle)" ]; then
+        # Checked before iTerm2 for the same reason as Warp below.
+        handle=$(orca_handle)
+        if [ "${handle%%:*}" = "orca" ]; then
+            tab_title=$(orca_tab_title "${handle#*:}")
+        fi
     elif [ -n "$(warp_handle)" ]; then
         # Checked before iTerm2: Warp started from an iTerm2 tab inherits its
         # ITERM_SESSION_ID, which would send the click to that iTerm2 tab.
@@ -902,8 +956,9 @@ except Exception:
     # No handle means no tab, so the watch loop can never match it and the
     # marker would only keep the loop asking the terminal every second.
     # Warp cannot name its frontmost tab either, so a Warp marker would only
-    # keep the loop polling.
-    if [ -n "$handle" ] && [ "${handle%%:*}" != "warp" ]; then
+    # keep the loop polling. Nor can Orca: its CLI marks the active tab in
+    # each workspace but cannot say which workspace is on screen.
+    if [ -n "$handle" ] && ! orca_or_warp "$handle"; then
         { mkdir -p "$PENDING_DIR" && printf '%s' "$handle" > "$(pending_path "$group_key")"; } 2>/dev/null || true
     fi
 
@@ -916,6 +971,7 @@ except Exception:
         vscode)         fallback_app="com.microsoft.VSCode" ;;
         WarpTerminal)   fallback_app=$(warp_bundle) ;;
         ghostty)        fallback_app="com.mitchellh.ghostty" ;;
+        Orca)           fallback_app="$ORCA_BUNDLE_ID" ;;
     esac
 
     # Sessions started outside a terminal (parented by launchd rather than a tab)
@@ -1090,7 +1146,8 @@ cmd_clear() {
         [ -n "$claude_session_id" ] && keys+=("$GROUP_PREFIX:$claude_session_id")
         [ "$AGENT" = "codex" ] && codex_thread="$claude_session_id"
         payload_cwd=$(json_get '.cwd')
-        handle=$(warp_handle)
+        handle=$(orca_handle)
+        [ -n "$handle" ] || handle=$(warp_handle)
         [ -n "$handle" ] || handle=$(bounded 8 bash "$SELF" resolve "$payload_cwd" "$codex_thread" | head -1)
         [ -n "$handle" ] && keys+=("$GROUP_PREFIX:${handle#*:}")
         # A notification posted while resolution was slow is keyed by tty, which
@@ -1128,6 +1185,18 @@ cmd_focus() {
             if [ "$scheme" = "warp" ]; then
                 open -b dev.warp.Warp-Stable >/dev/null 2>&1 || open -b dev.warp.Warp >/dev/null 2>&1
             fi
+            ;;
+        orca)
+            # Switching selects the tab without raising the window, so the app
+            # is raised either way.
+            local cli
+            cli=$(orca_cli)
+            [ -n "$cli" ] && bounded 5 "$cli" terminal switch --terminal "$target" --json >/dev/null && result="ok"
+            open -b "$ORCA_BUNDLE_ID" >/dev/null 2>&1
+            ;;
+        orcachat)
+            # Orca's CLI has no way to select a chat tab.
+            bundle="$ORCA_BUNDLE_ID"
             ;;
         tty)
             # Deferred lookup: work out which terminal owns this tty now.
@@ -1193,15 +1262,32 @@ cmd_doctor() {
 
     echo "  terminals running:"
     local app
-    for app in iTerm2 Terminal Ghostty; do
+    for app in iTerm2 Terminal Ghostty Orca; do
         if app_running "$app"; then echo "    $app: yes"; else echo "    $app: no"; fi
     done
 
     local info handle name
-    info=$(bounded 8 bash "$SELF" resolve "$(pwd)")
-    handle=$(echo "$info" | head -1)
-    name=$(echo "$info" | sed -n 2p)
-    if [ -n "$handle" ]; then
+    handle=$(orca_handle)
+    if [ "${handle%%:*}" = "orca" ]; then
+        name=$(orca_tab_title "${handle#*:}")
+        if [ -n "$(orca_cli)" ] && [ -n "$name" ]; then
+            echo "  [ok]   this session is an Orca tab: $handle"
+            echo "         tab name: $name"
+        else
+            echo "  [warn] this session is an Orca tab ($handle), but Orca's CLI did not answer."
+            echo "         Notifications still post and raise Orca, without selecting the tab."
+        fi
+    elif [ -n "$handle" ]; then
+        echo "  [ok]   this session is an Orca chat: $handle"
+        echo "         Orca's CLI cannot select a chat tab, so a click raises Orca."
+    fi
+
+    [ -n "$handle" ] || info=$(bounded 8 bash "$SELF" resolve "$(pwd)")
+    [ -n "$handle" ] || handle=$(echo "$info" | head -1)
+    [ -n "$name" ] || name=$(echo "$info" | sed -n 2p)
+    if orca_or_warp "$handle"; then
+        :
+    elif [ -n "$handle" ]; then
         echo "  [ok]   this session resolves to a tab: $handle"
         echo "         tab name: $name"
     else
@@ -1209,6 +1295,17 @@ cmd_doctor() {
         echo "         Notifications still post and raise your terminal, without selecting a tab."
         echo "         Warp has no scripting support, and Ghostty can only be matched when one"
         echo "         tab is open on this directory."
+    fi
+
+    # Orca runs each of its Claude accounts from its own config folder, named in
+    # $CLAUDE_CONFIG_DIR, and the installer only writes ~/.claude.
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ "${CLAUDE_CONFIG_DIR%/}" != "$HOME/.claude" ]; then
+        if grep -q -E "agent-tab-notify|claude-code-tab-notify" "$CLAUDE_CONFIG_DIR/settings.json" 2>/dev/null; then
+            echo "  [ok]   hooks registered in $CLAUDE_CONFIG_DIR/settings.json"
+        else
+            echo "  [warn] this session reads its settings from $CLAUDE_CONFIG_DIR, which has no hooks."
+            echo "         Copy the agent-tab-notify hooks from ~/.claude/settings.json into its settings.json."
+        fi
     fi
 
     local settings="$HOME/.claude/settings.json"

@@ -58,6 +58,16 @@ and takes the first that answers:
   before `resolve`, because Warp started from an iTerm2 tab inherits that tab's
   `ITERM_SESSION_ID`. A click opens `<scheme>://session/<id>`. No marker is written, since
   Warp cannot name its frontmost tab. Undocumented by Warp; verified on 0.2026.10.14.
+- `orca:<term_ handle>`: from `$ORCA_TERMINAL_HANDLE` when `TERM_PROGRAM=Orca` (`orca_handle()`);
+  checked in `cmd_notify()` before Warp and `resolve`. The title comes from
+  `orca terminal show --json`; a click runs `orca terminal switch --terminal <handle>`, then
+  `open -b com.stablyai.orca`, since switching does not raise the window. `orca_cli()` finds
+  the CLI inside Orca.app, because the click has none of Orca's variables.
+- `orcachat:<session id>`: an Orca chat tab (`ORCA_STRUCTURED_SESSION=1`,
+  `$ORCA_AGENT_SESSION_ID`). No tty and no CLI command to select it, so a click only raises
+  Orca. Without this handle, chat sessions were skipped as unroutable whenever iTerm2's
+  integration is installed. Neither Orca handle writes a marker: the CLI marks the active tab
+  in each workspace but cannot say which workspace is on screen. Verified on Orca 1.4.255.
 
 `resolve` prints the handle, then the tab name, then the tab's position in its window, then
 (iTerm2 and the Codex lookup only) the window's tab count. `tab_shortcut()` turns the last two
