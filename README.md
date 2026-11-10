@@ -1,10 +1,10 @@
 # agent-tab-notify
 
-Notifications for Claude Code and Codex that take you to the right tab in iTerm2, Terminal, Ghostty, Warp or Orca, and clear themselves once you've seen them.
+Notifications for Claude Code and Codex that take you to the right tab in iTerm2, Terminal, Ghostty or Warp, and clear themselves once you've seen them.
 
 When you run AI agents in several tabs, it's hard to tell which one needs you. Most notification tools for Claude Code tell you that something finished. This one also tells you where, and keeps itself tidy:
 
-- **Click to go straight there.** Clicking switches to the exact tab, even in another window, in iTerm2, Terminal, Ghostty, Warp and Orca, and inside tmux.
+- **Click to go straight there.** Clicking switches to the exact tab, even in another window, in iTerm2, Terminal, Ghostty and Warp, and inside tmux.
 - **It clears itself.** A notification goes away when you switch to its tab or type there. Each tab keeps only its latest one, so old ones don't pile up.
 - **It says what's going on.** The title is the tab's name and shortcut, and the message is the start of the reply, or the exact command Claude wants permission to run.
 - **It stays quiet when you can already see the answer,** but still calls you if you've stepped away.
@@ -21,7 +21,7 @@ When you run AI agents in several tabs, it's hard to tell which one needs you. M
 - A Mac.
 - [Homebrew](https://brew.sh), to install one small tool.
 - Claude Code, Codex, or both.
-- One of these terminals: iTerm2, Terminal (the one built into macOS), Ghostty, Warp or Orca. See [Which terminals work](#which-terminals-work) for how well each one works.
+- One of these terminals: iTerm2, Terminal (the one built into macOS), Ghostty or Warp. See [Which terminals work](#which-terminals-work) for how well each one works.
 
 ## Install
 
@@ -101,7 +101,7 @@ To stop it:
 launchctl unload -w ~/Library/LaunchAgents/com.zackkatz.agent-tab-notify.watch.plist
 ```
 
-The watcher checks about once a second and costs almost nothing. It only asks your terminal which tab is in front while a notification is waiting. It works with iTerm2 and Terminal only, because Ghostty, Warp and Orca can't report which tab is in front.
+The watcher checks about once a second and costs almost nothing. It only asks your terminal which tab is in front while a notification is waiting. It works with iTerm2 and Terminal only, because Ghostty and Warp can't report which tab is in front.
 
 No notification is sent for the tab you're looking at, unless you've stepped away. A notification for the tab in front stays until you leave that tab and come back. Switching to a tab clears its notification after you've stayed there 2 seconds. To control how clearing works, see the `clear_on_switch` and `clear_delay` [settings](#settings).
 
@@ -113,15 +113,11 @@ No notification is sent for the tab you're looking at, unless you've stepped awa
 | Terminal | the exact tab | yes | yes |
 | Ghostty | the tab, if it's the only one open in that folder | yes | no |
 | Warp | the session's window and tab | no | no |
-| Orca terminal tab | the exact tab | no | no |
-| Orca chat tab | Orca (no particular tab) | no | no |
 | VS Code or another terminal | that app (no particular tab) | no | no |
 
 **Ghostty** can only be matched by folder. If two Ghostty tabs are open in the same folder, the tool can't tell them apart, so clicking does nothing rather than risk the wrong tab.
 
 **Warp** can't be controlled by scripts, but since 2026 every Warp tab has its own link that brings it to the front, and clicking uses that link. Warp can't share a tab's name or position, so the title shows the Claude Code session's name instead (see below), with no ⌘ number. Warp hasn't documented this link yet, so a Warp update could break it.
-
-**Orca** gives each terminal tab its own ID, and clicking asks Orca's command-line tool to switch to that tab. The title is the tab's name in Orca. Orca's command-line tool can't switch to a chat tab, so clicking a chat tab's notification only brings Orca to the front, and the title is the session's name. Orca runs each of its Claude accounts from its own settings folder, so if notifications don't appear in Orca, run `bin/agent-tab-notify doctor` from an Orca tab: it says whether that folder has the hooks.
 
 ## What the notification shows
 
@@ -169,7 +165,7 @@ Changes apply to the next notification. The watcher notices a change within a se
 | `notify_on_input` | Notify when Claude needs permission or input | `1` (on) |
 | `notify_on_idle` | Notify for Claude Code's "Claude is waiting for your input" reminder, sent about a minute after a reply. Off by default, because it would replace the notification that shows the reply | `0` (off) |
 | `notify_while_agents_run` | Notify when Claude stops while background agents are still working, including an agent that is waiting on its own background work | `0` (off) |
-| `notify_when_focused` | Notify even when the session's tab is the one in front. Off by default, since you can already see it. Works in iTerm2 and Terminal; Ghostty, Warp and Orca tabs always notify | `0` (off) |
+| `notify_when_focused` | Notify even when the session's tab is the one in front. Off by default, since you can already see it. Works in iTerm2 and Terminal; Ghostty and Warp tabs always notify | `0` (off) |
 | `away_after` | When you haven't used the keyboard or mouse for this many seconds, the tab in front gets a notification too, so a finished task still calls you back. `0` never notifies for the tab in front | `60` |
 | `sound_done` | Sound when Claude finishes. Any name from `/System/Library/Sounds`, such as `Ping`, or `none` | `Blow` |
 | `sound_input` | Sound when Claude needs you | `Glass` |
